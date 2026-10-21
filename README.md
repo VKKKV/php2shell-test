@@ -53,10 +53,12 @@ PoC's heap-shaping window. `--control` (small filename) and the 8.5.12 build are
 the two controls.
 
 `--sapi fpm` runs the same pair through nginx + php-fpm with
-`pm.max_children=1`. It reports `NO REUSE`: the arm's startup fatal exits the
-child (code 70) and the master respawns it, so the fire request never sees the
-stale context. The reuse needs a worker that survives the bailout — cli-server
-does, php-fpm does not.
+`pm.max_children=1`. It reports `NO REUSE`, for a measured reason: with an
+application-level producer the child survives and the instrumented build shows
+the stale `BG(serialize)` context (level 1, no free), but under FPM the next
+request's upload-progress encode runs *after* RINIT, which has already cleared
+it. The cli-server runs that encode before RINIT, which is why the cli lab
+fires.
 
 Ported from
 [RemiPelloux/php-session-upload-progress-uaf](https://github.com/RemiPelloux/php-session-upload-progress-uaf)

