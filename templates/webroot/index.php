@@ -1,5 +1,6 @@
 <?php
-session_start();
-echo 'PHP ' . PHP_VERSION . ' SAPI=' . php_sapi_name()
-    . ' upload_progress.cleanup=' . (int) ini_get('session.upload_progress.cleanup')
-    . ' use_only_cookies=' . (int) ini_get('session.use_only_cookies') . "\n";
+// Endpoint for the 109618 lab (mod_php). Nothing here matters: the trigger is
+// the multipart body parsed during request startup.
+echo 'ok pid=', getmypid(), ' php=', PHP_VERSION,
+    ' memory_limit=', ini_get('memory_limit'),
+    ' post_max_size=', ini_get('post_max_size'), "\n";

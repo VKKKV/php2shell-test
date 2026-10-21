@@ -1,0 +1,146 @@
+services:
+  php8511:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+      args:
+        PHP_VERSION: "8.5.11"
+        PHP_SHA256: "d9be75c08e8c316f4c8f4194d8fbe1750a15f6a6d9d4e3fe72082abeeb800360"
+    image: php2shell:8.5.11-cli
+    profiles: ["109619"]
+    command:
+      - php
+      - -n
+      - -d
+      - session.upload_progress.enabled=1
+      - -d
+      - session.upload_progress.cleanup=1
+      - -d
+      - session.save_path=/tmp
+      - -d
+      - memory_limit=8M
+      - -d
+      - display_errors=1
+      - -S
+      - 0.0.0.0:8080
+      - -t
+      - /srv/php2shell-docroot
+    working_dir: /srv/php2shell-docroot
+    volumes:
+      - ./webroot:/srv/php2shell-docroot:ro
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:18119:8080"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  php8512:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+      args:
+        PHP_VERSION: "8.5.12"
+        PHP_SHA256: "08bc2eba2a588654ade1357174aa646b761556c862dda0678345ee29ed481209"
+    image: php2shell:8.5.12-cli
+    profiles: ["109619"]
+    command:
+      - php
+      - -n
+      - -d
+      - session.upload_progress.enabled=1
+      - -d
+      - session.upload_progress.cleanup=1
+      - -d
+      - session.save_path=/tmp
+      - -d
+      - memory_limit=8M
+      - -d
+      - display_errors=1
+      - -S
+      - 0.0.0.0:8080
+      - -t
+      - /srv/php2shell-docroot
+    working_dir: /srv/php2shell-docroot
+    volumes:
+      - ./webroot:/srv/php2shell-docroot:ro
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:18120:8080"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+
+  apache8511:
+    build:
+      context: .
+      dockerfile: Dockerfile.apache
+      args:
+        PHP_VERSION: "8.5.11"
+        PHP_SHA256: "d9be75c08e8c316f4c8f4194d8fbe1750a15f6a6d9d4e3fe72082abeeb800360"
+    image: php2shell:8.5.11-apache
+    profiles: ["109618"]
+    volumes:
+      - ./webroot:/srv/www:ro
+    tmpfs:
+      - /var/run/apache2
+      - /var/lock/apache2
+      - /var/log/apache2
+    ports:
+      - "127.0.0.1:18118:80"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+
+  apache8512:
+    build:
+      context: .
+      dockerfile: Dockerfile.apache
+      args:
+        PHP_VERSION: "8.5.12"
+        PHP_SHA256: "08bc2eba2a588654ade1357174aa646b761556c862dda0678345ee29ed481209"
+    image: php2shell:8.5.12-apache
+    profiles: ["109618"]
+    volumes:
+      - ./webroot:/srv/www:ro
+    tmpfs:
+      - /var/run/apache2
+      - /var/lock/apache2
+      - /var/log/apache2
+    ports:
+      - "127.0.0.1:18117:80"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s

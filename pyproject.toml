@@ -1,7 +1,7 @@
 [project]
 name = "php2shell-test"
 version = "0.1.0"
-description = "PHP session-poisoning lab + verified exploit chains (stdlib-only CLI)"
+description = "CVE-2026-109619 / CVE-2026-109618 labs (stdlib-only CLI)"
 requires-python = ">=3.10"
 dependencies = []
 

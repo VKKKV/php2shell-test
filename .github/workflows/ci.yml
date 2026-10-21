@@ -23,4 +23,7 @@ jobs:
           python php2shell.py --help >/dev/null
           python php2shell.py gen
       - name: Validate compose
-        run: docker compose -f lab/docker-compose.yml config -q
+        run: docker compose -f lab/compose.yml config -q
+
+  # Building PHP four times is too slow for every push. Run the lab matrix by
+  # hand before a release: `python3 php2shell.py verify --all`.
