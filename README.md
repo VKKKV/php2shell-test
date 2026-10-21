@@ -40,10 +40,9 @@ marker file exists. The read request is a plain GET, because a multipart POST
 would open the session during RINIT, before userland classes exist, and the
 injected object could only become `__PHP_Incomplete_Class`.
 
-The UAF check is behavioural on the stock image; the ASAN trace (heap
+The UAF check is behavioural on the stock image. The ASAN trace (heap
 use-after-free read at `var_unserializer.c:850`, freed in `var_destroy`) comes
-from a sanitizer build and is recorded in
-[docs/verification.md](docs/verification.md).
+from a sanitizer build (`-fsanitize=address`, `USE_ZEND_ALLOC=0`).
 
 ## Not reproduced
 
@@ -53,7 +52,6 @@ crash, no worker change. The independent audit
 [xuehuolll/CVE-2026-109618-109619-audit](https://github.com/xuehuolll/CVE-2026-109618-109619-audit)
 agrees for stock builds. CVE-2026-109618 / 109619 are RESERVED at cve.org; the
 number-to-mechanism mappings circulating in community repos are unconfirmed.
-Mechanism notes and what we tested: [docs/mechanisms.md](docs/mechanisms.md).
 
 ## Lab
 
@@ -90,31 +88,28 @@ multipart header or container path.
 
 ## Mitigation
 
-`session.upload_progress.enabled = Off` breaks every chain in this repo
-(verified, recipe in [docs/verification.md](docs/verification.md)). Community
-edge/WAF rule sets and detection signals are listed in
-[docs/mechanisms.md](docs/mechanisms.md). Blocking multipart bodies with
+`session.upload_progress.enabled = Off` breaks every chain in this repo:
+both `rce` and `mismatch` then fail with `no session file was written`.
+Restore the lab with `up --regen`. Blocking multipart bodies with
 `PHP_SESSION_UPLOAD_PROGRESS` works but needs body inspection and breaks
-legitimate upload progress.
+legitimate upload progress; community rule sets exist for
+[Apache/ModSecurity, lighttpd, Caddy](https://github.com/eness/php2shell-CVE-2026-109618-CVE-2026-109619-PoC)
+and as [Sigma/Suricata/YARA](https://github.com/mikensec/php2shell-lab).
 
 ## Layout
 
 ```
 php2shell.py            stdlib-only CLI (render lab, run chains)
 templates/              source of truth: PHP, nginx, compose, php.ini
-tests/                  unit tests + `-m integration` full cycle
-docs/mechanisms.md      what each primitive does, what we could not reproduce
-docs/verification.md    command-by-command record, versions, ASAN trace
 lab/                    generated at runtime, gitignored
 ```
 
 ## Development
 
 ```sh
-pip install ruff pytest
+pip install ruff
 ruff check . && ruff format --check .
-pytest -q                 # unit tests, no docker
-pytest -q -m integration  # up → rce → mismatch → uaf → down
+python3 php2shell.py up && python3 php2shell.py rce && python3 php2shell.py mismatch
 ```
 
 ## Scope
