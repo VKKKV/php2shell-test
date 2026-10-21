@@ -30,6 +30,7 @@ python3 php2shell.py 109618 --php 8.5.12 --vector headers
 python3 php2shell.py 109618 --php 8.5.11 --asan --count 1000000  # ASAN build
 
 python3 php2shell.py verify --all          # positive/negative matrix
+python3 php2shell.py 109619-rce --fetch    # 8.4.26 RCE (official image), 8.4.27 control
 python3 php2shell.py down
 ```
 
@@ -64,6 +65,33 @@ Ported from
 [RemiPelloux/php-session-upload-progress-uaf](https://github.com/RemiPelloux/php-session-upload-progress-uaf)
 (MIT), which stops at memory corruption — no code execution.
 
+### End-to-end RCE (external PoC, pinned)
+
+The public chain from
+[9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)
+goes further on the official `php:8.4.26-apache` image: it turns the corrupted
+shutdown into a heap leak (Set-Cookie), then a libphp leak, then a fake
+HashTable whose `pDestructor` is `zif_system`.
+
+```sh
+python3 php2shell.py 109619-rce --fetch       # clone the pinned PoC and run
+# PROOF (8.4.26): uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+python3 php2shell.py 109619-rce --php 8.4.27  # fixed control
+# HEAP_LEAK_FAILED / NO PROOF (8.4.27)
+```
+
+The upstream repository has no license file, so it is not vendored: `--fetch`
+(or `scripts/fetch-9bie.sh`) clones it into `lab/third_party/9bie` at
+`4586f5cc120c82fd468b17469202bac629810ad9` (gitignored). The chain needs
+`display_errors=On`, `memory_limit=8M`, `post_max_size=64M` and a single
+prefork worker, which is what `templates/php-8426.ini` and
+`templates/apache-8426.conf` provide. `--cmd` overrides the default
+`id>/out/p1` (14-byte limit; longer commands: write a script and run
+`sh</out/c`).
+
+This is CVE-2026-109619 (cross-request state), not 109618.
+
 ## How 109618 works
 
 The advisory names three memory amplifiers that stay inside `post_max_size`
@@ -88,12 +116,14 @@ observable; that is why this lab is mod_php.
 ## Layout
 
 ```
-php2shell.py            CLI: up / down / gen / 109619 / 109618 / verify
+php2shell.py            CLI: up / down / gen / 109619 / 109619-rce / 109618 / verify
 templates/
   Dockerfile.cli        php.net tarball -> CLI + session
   Dockerfile.apache     php.net tarball -> mod_php on apache2 prefork
   apache.conf           DocumentRoot /srv/www + the 109618 ini values
-  compose.yml           four services, profiles 109619 / 109618, loopback only
+  php-8426.ini          official-image ini for the 109619 RCE chain
+  apache-8426.conf      single prefork worker for the 109619 RCE chain
+  compose.yml           services for profiles 109619 / 109618 / 109619-rce
   webroot/              probe.php (109619), index.php (109618)
 docs/
   advisory-2026-10-21.md   official GHSA text, versions, fix commit, path comparison

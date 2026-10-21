@@ -15,10 +15,11 @@ worker dies (SIGSEGV, exit 139 in the lab).
 
 Proves: the stale-context reuse is real on 8.5.11 and gone on 8.5.12.
 
-Does not prove: code execution. The reference PoC
-([RemiPelloux/php-session-upload-progress-uaf](https://github.com/RemiPelloux/php-session-upload-progress-uaf))
-stops at memory corruption, and so does this lab. Turning the corrupted
-`HashTable` into a controlled write is a separate research step.
+Does not prove: code execution on this 8.5.x build. The reference PoC stops at
+memory corruption, and so does this lab. An end-to-end RCE does exist for the
+same mechanism on the official 8.4.26 image via the pinned 9bie chain (below),
+but it needs `display_errors=On` and a heap layout tuned for 8.4.26; it does not
+carry over to 8.5.11/8.5.12 as is.
 
 Instrumented evidence: a build with `fprintf` in `php_var_serialize_init()`
 prints `SER_INIT level=0 data=(nil)` and `SER_ALLOC` for the arm request, and no
@@ -50,6 +51,31 @@ separate reasons, both measured:
 
 So the BG(serialize) variant of 109619 is cli-server-shaped. The official FPM
 session-lifecycle path must use other worker-retained state, not this context.
+
+### End-to-end RCE (external PoC, pinned)
+
+`php2shell.py 109619-rce [--php 8.4.26|8.4.27]` runs
+[9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp)
+at commit `4586f5cc120c82fd468b17469202bac629810ad9` against the official
+`php:8.4.26-apache` image (single prefork worker, `display_errors=On`,
+`memory_limit=8M`, `post_max_size=64M`). Measured here:
+
+| target | result |
+| --- | --- |
+| 8.4.26 | `PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)` |
+| 8.4.27 | `HEAP_LEAK_FAILED`, no proof |
+
+What it proves: the 109619 class is exploitable end to end — OOM producer →
+Set-Cookie heap leak → libphp leak → fake HashTable with
+`pDestructor=zif_system` — not just a crash.
+
+What it does not prove: that production defaults are exploitable. The chain
+needs `display_errors=On` (the leak is carried in the error response) and a
+single prefork worker; the upstream author says the `display_errors=0` leak
+works but the full chain is not published yet. It is also 109619, not 109618.
+
+The PoC is not vendored (upstream has no license): `scripts/fetch-9bie.sh`
+clones it into `lab/third_party/9bie` at the pinned commit (gitignored).
 
 ## CVE-2026-109618 — OOM corruption during request startup
 

