@@ -62,6 +62,8 @@ PORTS = {
     ("109618-asan", "8.5.11"): 18123,
     ("109619-rce", "8.4.26"): 18124,
     ("109619-rce", "8.4.27"): 18125,
+    ("109619-rce", "8.2.34"): 18126,
+    ("109619-rce", "8.5.12"): 18127,
 }
 SERVICES = {
     ("109619", "8.5.11"): "php8511",
@@ -73,6 +75,8 @@ SERVICES = {
     ("109618-asan", "8.5.11"): "apache-asan8511",
     ("109619-rce", "8.4.26"): "apache8426",
     ("109619-rce", "8.4.27"): "apache8427",
+    ("109619-rce", "8.2.34"): "apache8234",
+    ("109619-rce", "8.5.12"): "apache8512rce",
 }
 VERSIONS = ("8.5.11", "8.5.12")
 RCE_PIN = "4586f5cc120c82fd468b17469202bac629810ad9"
@@ -106,7 +110,7 @@ def render() -> None:
         shutil.copy2(TEMPLATES / name, LAB / name)
 
     # The 9bie PoC runs as www-data and writes the proof into /out.
-    for name in ("out-rce", "out-rce-fixed"):
+    for name in ("out-rce", "out-rce-fixed", "out-rce-8234", "out-rce-8512"):
         out = LAB / name
         out.mkdir(exist_ok=True)
         with contextlib.suppress(PermissionError):
@@ -510,7 +514,12 @@ def chain_109619_rce(
     render()
     compose("--profile", "109619-rce", "up", "-d", "--wait", service, timeout=900)
     container = cid(service)
-    out = LAB / ("out-rce" if php == "8.4.26" else "out-rce-fixed")
+    out = LAB / {
+        "8.4.26": "out-rce",
+        "8.4.27": "out-rce-fixed",
+        "8.2.34": "out-rce-8234",
+        "8.5.12": "out-rce-8512",
+    }[php]
     proof = out / "p1"
     proof.unlink(missing_ok=True)
     offsets = out / "offsets.env"
@@ -606,7 +615,7 @@ def main() -> int:
     p.add_argument("--timeout", type=int, default=30)
 
     p = sub.add_parser("109619-rce", help="RCE with the pinned 9bie PoC (8.4.26 vulnerable)")
-    p.add_argument("--php", choices=["8.4.26", "8.4.27"], default="8.4.26")
+    p.add_argument("--php", choices=["8.4.26", "8.4.27", "8.2.34", "8.5.12"], default="8.4.26")
     p.add_argument("--fetch", action="store_true", help="clone/update the pinned PoC first")
     p.add_argument("--cmd", default=None, help="command to run (<=14 bytes, or sh</out/c)")
     p.add_argument("--retries", type=int, default=3)

@@ -62,8 +62,10 @@ at commit `4586f5cc120c82fd468b17469202bac629810ad9` against the official
 
 | target | result |
 | --- | --- |
+| 8.2.34 | bug present (`zend_mm_heap corrupted`, child Abort) but `HEAP_LEAK_FAILED` — chain is 8.4.26-tuned |
 | 8.4.26 | `PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)` |
-| 8.4.27 | `HEAP_LEAK_FAILED`, no proof |
+| 8.4.27 | `HEAP_LEAK_FAILED`, no crash lines |
+| 8.5.12 | `HEAP_LEAK_FAILED`, no crash lines |
 
 What it proves: the 109619 class is exploitable end to end — OOM producer →
 Set-Cookie heap leak → libphp leak → fake HashTable with

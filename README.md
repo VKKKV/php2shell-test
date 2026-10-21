@@ -78,8 +78,22 @@ python3 php2shell.py 109619-rce --fetch       # clone the pinned PoC and run
 # PROOF (8.4.26): uid=33(www-data) gid=33(www-data) groups=33(www-data)
 
 python3 php2shell.py 109619-rce --php 8.4.27  # fixed control
-# HEAP_LEAK_FAILED / NO PROOF (8.4.27)
+python3 php2shell.py 109619-rce --php 8.2.34  # vulnerable branch, pre-8.2.35
+python3 php2shell.py 109619-rce --php 8.5.12  # latest fixed
 ```
+
+Measured on the official images:
+
+| target | bug present | 9bie chain |
+| --- | --- | --- |
+| 8.2.34 | yes — producer requests abort the child (`zend_mm_heap corrupted`) | `HEAP_LEAK_FAILED` |
+| 8.4.26 | yes | `PROOF: uid=33(www-data)` |
+| 8.4.27 | no | `HEAP_LEAK_FAILED` |
+| 8.5.12 | no | `HEAP_LEAK_FAILED` |
+
+8.2.34 is vulnerable per the advisory (fixed in 8.2.35) and the crash confirms
+it, but the published chain is shaped for the 8.4.26 heap; porting it to the
+8.2 Zend Engine means re-tuning the spray and the 167-byte carrier offset.
 
 The upstream repository has no license file, so it is not vendored: `--fetch`
 (or `scripts/fetch-9bie.sh`) clones it into `lab/third_party/9bie` at

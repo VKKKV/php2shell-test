@@ -315,3 +315,49 @@ services:
       timeout: 2s
       retries: 30
       start_period: 3s
+
+  apache8234:
+    image: php:8.2.34-apache
+    profiles: ["109619-rce"]
+    volumes:
+      - ./webroot:/var/www/html:ro
+      - ./php-8426.ini:/usr/local/etc/php/conf.d/zz-php2shell.ini:ro
+      - ./apache-8426.conf:/etc/apache2/conf-enabled/zz-php2shell.conf:ro
+      - ./out-rce-8234:/out
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:18126:80"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+
+  apache8512rce:
+    image: php:8.5.12-apache
+    profiles: ["109619-rce"]
+    volumes:
+      - ./webroot:/var/www/html:ro
+      - ./php-8426.ini:/usr/local/etc/php/conf.d/zz-php2shell.ini:ro
+      - ./apache-8426.conf:/etc/apache2/conf-enabled/zz-php2shell.conf:ro
+      - ./out-rce-8512:/out
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:18127:80"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
