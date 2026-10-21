@@ -124,6 +124,22 @@ becomes impractical; a streaming front end keeps it open for the whole upload.
 `cleanup=On` alone does not close the window, it only removes the progress entry
 when the request ends.
 
+### Where the sink lives
+
+PHP gives you the write; the application has to give you the read. Typical
+`include` sinks that take a path from the request:
+
+- template / theme / language loaders: `?lang=`, `?template=`, `?theme=`, `?view=`
+- module and page routers that concatenate: `index.php?module=news`
+- file viewers: `download.php?file=`, `preview.php?path=`, log readers
+- image / thumbnail helpers: `thumb.php?src=`
+- plugin and addon loaders: `?plugin=`, `?addon=`
+
+Probe a candidate with a harmless path and watch for
+`include(...): Failed to open stream` — the warning names the function and the
+resolved path, so it tells you whether the parameter reaches an `include` at
+all. No payload is needed for that step.
+
 ## Mitigation
 
 `session.upload_progress.enabled = Off` breaks every chain in this repo: both
