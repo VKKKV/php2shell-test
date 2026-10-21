@@ -140,6 +140,23 @@ Probe a candidate with a harmless path and watch for
 resolved path, so it tells you whether the parameter reaches an `include` at
 all. No payload is needed for that step.
 
+### What this does not bypass
+
+Session poisoning only supplies a file whose bytes the attacker controls. It
+relaxes nothing about the include itself:
+
+- an allowlist or a name→path map means the parameter never reaches `include`
+- a suffix appended by the app (`include($p . '.php')`) cannot be satisfied:
+  the session file is `sess_<sid>`, with no extension
+- `open_basedir` that excludes the session directory blocks the read
+- `session.save_handler=redis|memcached` means there is no file at all
+- `session.upload_progress.enabled=Off` means nothing gets written
+- `session.use_strict_mode=On` without an app-issued SID means the SID is replaced
+
+It replaces log poisoning, upload tricks and `php://input` as the *write* half
+of an LFI, and it is worth trying when the app has no upload feature and the
+log path is unknown or unreadable.
+
 ## Mitigation
 
 `session.upload_progress.enabled = Off` breaks every chain in this repo: both
