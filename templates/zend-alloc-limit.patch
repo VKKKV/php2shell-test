@@ -1,0 +1,11 @@
+--- Zend/zend_alloc.c
++++ Zend/zend_alloc.c
+@@ -3285,7 +3285,7 @@
+ 		zend_mm_heap *mm_heap = alloc_globals->mm_heap = malloc(sizeof(zend_mm_heap));
+ 		memset(mm_heap, 0, sizeof(zend_mm_heap));
+ 		mm_heap->use_custom_heap = ZEND_MM_CUSTOM_HEAP_STD;
+-		mm_heap->limit = (size_t)Z_L(-1) >> 1;
++		mm_heap->limit = tracked ? (size_t)64 * 1024 * 1024 : ((size_t)Z_L(-1) >> 1);
+ 		mm_heap->overflow = 0;
+ 
+ 		if (!tracked) {

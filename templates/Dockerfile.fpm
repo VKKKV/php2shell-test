@@ -1,0 +1,27 @@
+# php-fpm built from the official tarball, one static worker (pm.max_children=1)
+# so two requests provably hit the same child.
+FROM debian:bookworm-slim
+
+ARG PHP_VERSION=8.5.11
+ARG PHP_SHA256=
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libxml2-dev pkg-config ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN curl -fsSL -o php.tar.xz "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" \
+    && echo "${PHP_SHA256}  php.tar.xz" | sha256sum -c - \
+    && tar xf php.tar.xz \
+    && mv "php-${PHP_VERSION}" php
+
+WORKDIR /src/php
+RUN ./configure --disable-all --enable-fpm --enable-cli --enable-session --without-pear \
+    && make -j"$(nproc)" \
+    && make install
+
+COPY php-fpm.conf /usr/local/etc/php-fpm.conf
+COPY php-fpm-pool.conf /usr/local/etc/php-fpm.d/www.conf
+
+EXPOSE 9000
+CMD ["php-fpm", "-F"]

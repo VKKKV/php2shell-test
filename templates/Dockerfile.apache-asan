@@ -1,0 +1,48 @@
+# mod_php built with AddressSanitizer, for the 109618 corruption check.
+# The module is linked with -fsanitize=address; Apache loads libasan via
+# LD_PRELOAD (set in compose) so the runtime is first in the library list.
+FROM debian:bookworm-slim
+
+ARG PHP_VERSION=8.5.11
+ARG PHP_SHA256=
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libxml2-dev pkg-config ca-certificates curl xz-utils \
+        apache2 apache2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN curl -fsSL -o php.tar.xz "https://www.php.net/distributions/php-${PHP_VERSION}.tar.xz" \
+    && echo "${PHP_SHA256}  php.tar.xz" | sha256sum -c - \
+    && tar xf php.tar.xz \
+    && mv "php-${PHP_VERSION}" php
+
+COPY zend-alloc-limit.patch /src/
+WORKDIR /src/php
+RUN patch -p0 < /src/zend-alloc-limit.patch
+
+RUN APXS="$(command -v apxs2 || command -v apxs)" \
+    && ./configure --with-apxs2="$APXS" --disable-all --enable-cli --enable-session \
+        --enable-debug --without-pear \
+        CFLAGS="-fsanitize=address -g -O1 -fno-omit-frame-pointer" \
+        LDFLAGS="-fsanitize=address" \
+    && make -j"$(nproc)" \
+    && make install
+
+RUN printf 'LoadModule php_module /usr/lib/apache2/modules/libphp.so\n' \
+        > /etc/apache2/mods-available/php.load \
+    && a2enmod php \
+    && (a2dismod mpm_event || true) \
+    && a2enmod mpm_prefork
+
+COPY apache.conf /etc/apache2/conf-available/php2shell.conf
+RUN a2enconf php2shell \
+    && (a2dissite 000-default || true)
+
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.8 \
+    USE_ZEND_ALLOC=0 \
+    USE_TRACKED_ALLOC=1 \
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=0:symbolize=1
+
+EXPOSE 80
+CMD ["apachectl", "-D", "FOREGROUND"]

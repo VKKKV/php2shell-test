@@ -27,6 +27,7 @@ python3 php2shell.py 109619 --control      # -> SURVIVED (no OOM, no reuse)
 python3 php2shell.py up --only 109618      # builds two mod_php images
 python3 php2shell.py 109618 --php 8.5.11 --vector headers
 python3 php2shell.py 109618 --php 8.5.12 --vector headers
+python3 php2shell.py 109618 --php 8.5.11 --asan --count 1000000  # ASAN build
 
 python3 php2shell.py verify --all          # positive/negative matrix
 python3 php2shell.py down
@@ -51,6 +52,12 @@ The docroot is `/srv/php2shell-docroot` (22 characters), matching the reference
 PoC's heap-shaping window. `--control` (small filename) and the 8.5.12 build are
 the two controls.
 
+`--sapi fpm` runs the same pair through nginx + php-fpm with
+`pm.max_children=1`. It reports `NO REUSE`: the arm's startup fatal exits the
+child (code 70) and the master respawns it, so the fire request never sees the
+stale context. The reuse needs a worker that survives the bailout — cli-server
+does, php-fpm does not.
+
 Ported from
 [RemiPelloux/php-session-upload-progress-uaf](https://github.com/RemiPelloux/php-session-upload-progress-uaf)
 (MIT), which stops at memory corruption — no code execution.
@@ -70,7 +77,8 @@ The lab runs them against mod_php with `memory_limit=16M` and
 (`Allowed memory size ... in Unknown on line 0`) and 8.5.12 handles the same body
 normally; the corruption itself was not reproduced, so treat this lab as a
 trigger harness for the precondition, not as an RCE PoC. An OOM without a crash
-is reported as `OOM ONLY`.
+is reported as `OOM ONLY`. `--asan` targets an AddressSanitizer mod_php build
+with the audit's tracked-allocator setup; it has not caught the corruption yet.
 
 Under php-fpm a startup failure exits the child, which is a different
 observable; that is why this lab is mod_php.
