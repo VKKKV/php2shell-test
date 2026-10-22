@@ -514,12 +514,15 @@ def chain_109619_rce(
     render()
     compose("--profile", "109619-rce", "up", "-d", "--wait", service, timeout=900)
     container = cid(service)
-    out = LAB / {
-        "8.4.26": "out-rce",
-        "8.4.27": "out-rce-fixed",
-        "8.2.34": "out-rce-8234",
-        "8.5.12": "out-rce-8512",
-    }[php]
+    out = (
+        LAB
+        / {
+            "8.4.26": "out-rce",
+            "8.4.27": "out-rce-fixed",
+            "8.2.34": "out-rce-8234",
+            "8.5.12": "out-rce-8512",
+        }[php]
+    )
     proof = out / "p1"
     proof.unlink(missing_ok=True)
     offsets = out / "offsets.env"
